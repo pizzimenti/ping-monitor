@@ -4,6 +4,7 @@ import QtQuick.Shapes
 import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
+import org.kde.plasma.plasma5support as Plasma5Support
 import org.kde.kirigami as Kirigami
 
 PlasmoidItem {
@@ -37,8 +38,7 @@ PlasmoidItem {
     property real gatewayTo: -1
     property real gatewayStartTime: 0
     property bool chartDirty: false
-    readonly property string statePath: StandardPaths.writableLocation(StandardPaths.RuntimeLocation) + "/ping-monitor-state"
-    readonly property string stateUrl: "file://" + statePath
+    readonly property string currentCommand: "ping-monitor-plasmoid-source"
     property int lastCloudflareSeq: -1
     property int lastGoogleSeq: -1
     property int lastGatewaySeq: -1
@@ -224,12 +224,8 @@ PlasmoidItem {
         if (!samplingActive) {
             return;
         }
-        const xhr = new XMLHttpRequest();
-        xhr.open("GET", stateUrl, false);
-        xhr.send();
-        if (xhr.status === 0 || xhr.status === 200) {
-            parseStateSnapshot(xhr.responseText || "");
-        }
+        executableSource.disconnectSource(currentCommand);
+        executableSource.connectSource(currentCommand);
     }
 
     Timer {
@@ -239,6 +235,19 @@ PlasmoidItem {
         repeat: true
         triggeredOnStart: true
         onTriggered: root.readStateFile()
+    }
+
+    Plasma5Support.DataSource {
+        id: executableSource
+        engine: "executable"
+        interval: 0
+        onNewData: (sourceName, sourceData) => {
+            if (sourceName !== root.currentCommand) {
+                return;
+            }
+            root.parseStateSnapshot(sourceData.stdout || "");
+            executableSource.disconnectSource(sourceName);
+        }
     }
 
     fullRepresentation: Item {

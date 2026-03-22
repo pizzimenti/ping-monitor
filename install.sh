@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 SERVICE_NAME="ping-monitor-daemon.service"
 PLASMOID_PLUGIN_ID="org.kde.plasma.pingmonitor"
+TARGET_LIB_DIR="/usr/local/lib/ping-monitor"
+TARGET_PLASMOID_SOURCE="/usr/local/bin/ping-monitor-plasmoid-source"
 
 upgrade_or_install_plasmoid() {
     local plasmoid_dir="$1"
@@ -30,6 +32,14 @@ upgrade_or_install_plasmoid() {
     fi
 }
 
+install -d -m755 "$TARGET_LIB_DIR"
+install -Dm755 "$SCRIPT_DIR/ping-monitor-plasmoid-source.py" "$TARGET_LIB_DIR/ping-monitor-plasmoid-source.py"
+install -Dm755 /dev/stdin "$TARGET_PLASMOID_SOURCE" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec python3 "/usr/local/lib/ping-monitor/ping-monitor-plasmoid-source.py" "$@"
+EOF
+
 mkdir -p "$USER_SYSTEMD_DIR"
 sed "s|@@REPO_DIR@@|${SCRIPT_DIR}|g" \
     "$SCRIPT_DIR/ping-monitor-daemon.service" \
@@ -41,4 +51,4 @@ systemctl --user restart "$SERVICE_NAME"
 
 upgrade_or_install_plasmoid "$SCRIPT_DIR" "$PLASMOID_PLUGIN_ID"
 
-echo "Installed ping-monitor daemon and refreshed applet registration."
+echo "Installed ping-monitor daemon, plasmoid source helper, and refreshed applet registration."
