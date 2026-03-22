@@ -27,16 +27,6 @@ PlasmoidItem {
     property real displayGooglePing: -1
     property real displayGatewayPing: -1
 
-    // Easing state for each provider.
-    property real cloudflareFrom: -1
-    property real cloudflareTo: -1
-    property real cloudflareStartTime: 0
-    property real googleFrom: -1
-    property real googleTo: -1
-    property real googleStartTime: 0
-    property real gatewayFrom: -1
-    property real gatewayTo: -1
-    property real gatewayStartTime: 0
     property bool chartDirty: false
     readonly property string currentCommand: "ping-monitor-plasmoid-source"
     property int lastCloudflareSeq: -1
@@ -80,8 +70,6 @@ PlasmoidItem {
             gatewayOnline = false
             currentGatewayPing = -1
             displayGatewayPing = -1
-            gatewayFrom = -1
-            gatewayTo = -1
         }
     }
 
@@ -117,18 +105,12 @@ PlasmoidItem {
     function applyPing(target, ping) {
         var value = (ping >= 0 && ping < 1000) ? ping : -1
         var now = Date.now()
-        var success = value >= 0
 
         if (target === "cloudflare") {
             if (value < 0) {
                 currentCloudflarePing = -1
                 displayCloudflarePing = -1
-                cloudflareFrom = -1
-                cloudflareTo = -1
             } else {
-                cloudflareFrom = value
-                cloudflareTo = value
-                cloudflareStartTime = now
                 currentCloudflarePing = value
                 displayCloudflarePing = value
                 lastPingReceivedText = formatHms(now)
@@ -137,12 +119,7 @@ PlasmoidItem {
             if (value < 0) {
                 currentGooglePing = -1
                 displayGooglePing = -1
-                googleFrom = -1
-                googleTo = -1
             } else {
-                googleFrom = value
-                googleTo = value
-                googleStartTime = now
                 currentGooglePing = value
                 displayGooglePing = value
                 lastPingReceivedText = formatHms(now)
@@ -151,13 +128,8 @@ PlasmoidItem {
             if (value < 0) {
                 currentGatewayPing = -1
                 displayGatewayPing = -1
-                gatewayFrom = -1
-                gatewayTo = -1
                 gatewayOnline = false
             } else {
-                gatewayFrom = value
-                gatewayTo = value
-                gatewayStartTime = now
                 currentGatewayPing = value
                 displayGatewayPing = value
                 gatewayOnline = true
@@ -380,12 +352,17 @@ PlasmoidItem {
                     property int gatewayValidPoints: 0
                     property real scrollAccPoints: 0
                     property real lastPathScale: -1
-                    property var historyTimes: []
-                    property var historyCloudflare: []
-                    property var historyGoogle: []
-                    property var historyGateway: []
                     readonly property int maxSmoothingLagSecs: 18
                     readonly property int maxHistorySecs: 3600 + maxSmoothingLagSecs * 2
+                    readonly property int historyCapacity: maxHistorySecs + 32
+                    property var historyTimes: new Array(historyCapacity)
+                    property var historyCloudflare: new Array(historyCapacity)
+                    property var historyGoogle: new Array(historyCapacity)
+                    property var historyGateway: new Array(historyCapacity)
+                    property int historyStart: 0
+                    property int historyCount: 0
+                    property real lastRenderedWidth: -1
+                    property real lastRenderedHeight: -1
 
                     property string cloudflarePath: ""
                     property string googlePath: ""
@@ -451,26 +428,40 @@ PlasmoidItem {
                         return (v >= 0 && !isNaN(v)) ? v : -1
                     }
 
+                    function historyPhysicalIndex(logicalIndex) {
+                        return (historyStart + logicalIndex) % historyCapacity
+                    }
+
+                    function historyTimeAt(logicalIndex) {
+                        return historyTimes[historyPhysicalIndex(logicalIndex)]
+                    }
+
+                    function historySampleAt(source, logicalIndex) {
+                        return source[historyPhysicalIndex(logicalIndex)]
+                    }
+
                     function pushHistorySample(nowMs) {
                         var cloudflareValue = normalizedSample((root.currentCloudflarePing >= 0 && root.displayCloudflarePing >= 0) ? root.displayCloudflarePing : -1)
                         var googleValue = normalizedSample((root.currentGooglePing >= 0 && root.displayGooglePing >= 0) ? root.displayGooglePing : -1)
                         var gatewayValue = normalizedSample((root.currentGatewayPing >= 0 && root.displayGatewayPing >= 0) ? root.displayGatewayPing : -1)
 
-                        historyTimes.push(nowMs)
-                        historyCloudflare.push(cloudflareValue)
-                        historyGoogle.push(googleValue)
-                        historyGateway.push(gatewayValue)
+                        var writeIndex
+                        if (historyCount < historyCapacity) {
+                            writeIndex = historyPhysicalIndex(historyCount)
+                            historyCount += 1
+                        } else {
+                            writeIndex = historyStart
+                            historyStart = (historyStart + 1) % historyCapacity
+                        }
+                        historyTimes[writeIndex] = nowMs
+                        historyCloudflare[writeIndex] = cloudflareValue
+                        historyGoogle[writeIndex] = googleValue
+                        historyGateway[writeIndex] = gatewayValue
 
                         var cutoff = nowMs - maxHistorySecs * 1000
-                        var removeCount = 0
-                        while (removeCount < historyTimes.length && historyTimes[removeCount] < cutoff) {
-                            removeCount += 1
-                        }
-                        if (removeCount > 0) {
-                            historyTimes.splice(0, removeCount)
-                            historyCloudflare.splice(0, removeCount)
-                            historyGoogle.splice(0, removeCount)
-                            historyGateway.splice(0, removeCount)
+                        while (historyCount > 0 && historyTimeAt(0) < cutoff) {
+                            historyStart = (historyStart + 1) % historyCapacity
+                            historyCount -= 1
                         }
                     }
 
@@ -517,7 +508,7 @@ PlasmoidItem {
                             return
                         }
 
-                        var sampleCount = historyTimes.length
+                        var sampleCount = historyCount
                         if (sampleCount <= 0) {
                             for (var clearIdx = 0; clearIdx < pointCount; ++clearIdx) {
                                 cloudflareSamples[clearIdx] = -1
@@ -615,15 +606,15 @@ PlasmoidItem {
                     }
 
                     function historyIndexAtOrBefore(tMs) {
-                        var n = historyTimes.length
-                        if (n <= 0 || tMs < historyTimes[0]) {
+                        var n = historyCount
+                        if (n <= 0 || tMs < historyTimeAt(0)) {
                             return -1
                         }
                         var lo = 0
                         var hi = n - 1
                         while (lo < hi) {
                             var mid = Math.floor((lo + hi + 1) / 2)
-                            if (historyTimes[mid] <= tMs) {
+                            if (historyTimeAt(mid) <= tMs) {
                                 lo = mid
                             } else {
                                 hi = mid - 1
@@ -633,8 +624,8 @@ PlasmoidItem {
                     }
 
                     function interpolatedHistoryValue(source, tMs) {
-                        var n = historyTimes.length
-                        if (n <= 0 || tMs < historyTimes[0]) {
+                        var n = historyCount
+                        if (n <= 0 || tMs < historyTimeAt(0)) {
                             return -1
                         }
                         var idx = historyIndexAtOrBefore(tMs)
@@ -642,13 +633,13 @@ PlasmoidItem {
                             return -1
                         }
                         if (idx >= n - 1) {
-                            return normalizedSample(source[n - 1])
+                            return normalizedSample(historySampleAt(source, n - 1))
                         }
 
-                        var t0 = historyTimes[idx]
-                        var t1 = historyTimes[idx + 1]
-                        var v0 = normalizedSample(source[idx])
-                        var v1 = normalizedSample(source[idx + 1])
+                        var t0 = historyTimeAt(idx)
+                        var t1 = historyTimeAt(idx + 1)
+                        var v0 = normalizedSample(historySampleAt(source, idx))
+                        var v1 = normalizedSample(historySampleAt(source, idx + 1))
                         if (v0 < 0 && v1 < 0) {
                             return -1
                         }
@@ -672,8 +663,18 @@ PlasmoidItem {
                         ensureBuffers()
                         fillVisibleFromHistory(nowMs)
                         scrollAccPoints = 0
+                        lastRenderedWidth = width
+                        lastRenderedHeight = height
                         rebuildPathsAndExtrema()
                         updateLiveLabels()
+                    }
+
+                    function scheduleResizeRefresh() {
+                        if (Math.abs(width - lastRenderedWidth) < sampleStepPx
+                                && Math.abs(height - lastRenderedHeight) < sampleStepPx) {
+                            return
+                        }
+                        resizeDebounce.restart()
                     }
 
                     function rebuildPathsAndExtrema() {
@@ -858,22 +859,29 @@ PlasmoidItem {
                     }
 
                     onWidthChanged: {
-                        refreshVisibleFromHistory()
+                        scheduleResizeRefresh()
                     }
 
                     onHeightChanged: {
-                        refreshVisibleFromHistory()
+                        scheduleResizeRefresh()
                     }
 
                     Component.onCompleted: {
                         refreshVisibleFromHistory()
                     }
 
-    Timer {
-        id: chartUpdateTimer
-        interval: 5000
-        repeat: true
-        running: chartView.visible && root.samplingActive
+                    Timer {
+                        id: resizeDebounce
+                        interval: 150
+                        repeat: false
+                        onTriggered: chartView.refreshVisibleFromHistory()
+                    }
+
+                    Timer {
+                        id: chartUpdateTimer
+                        interval: 5000
+                        repeat: true
+                        running: chartView.visible && root.samplingActive
                         onTriggered: {
                             var now = Date.now()
                             var oldAxisTop = root.axisTopMs()
