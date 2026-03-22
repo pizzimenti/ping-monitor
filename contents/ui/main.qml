@@ -879,7 +879,7 @@ PlasmoidItem {
 
                     Timer {
                         id: chartUpdateTimer
-                        interval: 5000
+                        interval: 1000
                         repeat: true
                         running: chartView.visible && root.samplingActive
                         onTriggered: {
