@@ -36,6 +36,8 @@ PlasmoidItem {
     property real gatewayFrom: -1
     property real gatewayTo: -1
     property real gatewayStartTime: 0
+    property bool chartDirty: false
+    property int consecutiveFailedPings: 0
 
     property int windowSecs: 60
     readonly property var windowOptions: [
@@ -171,6 +173,7 @@ PlasmoidItem {
     function applyPing(target, ping) {
         var value = (ping >= 0 && ping < 1000) ? ping : -1
         var now = Date.now()
+        var success = value >= 0
 
         if (target === "cloudflare") {
             if (value < 0) {
@@ -216,7 +219,18 @@ PlasmoidItem {
                 gatewayOnline = true
             }
         }
-
+        if (success) {
+            consecutiveFailedPings = 0
+            if (pingCycleTimer.interval !== 1000) {
+                pingCycleTimer.interval = 1000
+            }
+        } else {
+            consecutiveFailedPings += 1
+            if (consecutiveFailedPings >= 9 && pingCycleTimer.interval !== 5000) {
+                pingCycleTimer.interval = 5000
+            }
+        }
+        chartDirty = true
     }
 
     function cancelInFlightCommands() {
@@ -313,7 +327,7 @@ PlasmoidItem {
     // Refresh gateway IP periodically to keep route changes in sync.
     Timer {
         id: gatewayRefreshTimer
-        interval: 5000
+        interval: 30000
         running: root.samplingActive
         repeat: true
         triggeredOnStart: true
@@ -963,7 +977,7 @@ PlasmoidItem {
 
     Timer {
         id: chartUpdateTimer
-        interval: 2000
+        interval: 5000
         repeat: true
         running: chartView.visible && root.samplingActive
                         onTriggered: {
@@ -992,9 +1006,6 @@ PlasmoidItem {
                             }
 
                             var axisChanged = Math.abs(root.axisTopMs() - oldAxisTop) > 0.1
-                            if (rebuilt || axisChanged) {
-                                chartView.rebuildPathsAndExtrema()
-                            }
 
                             var visibleMax = chartView.cachedMax
                             if (root.windowSecs < 600) {
@@ -1012,7 +1023,11 @@ PlasmoidItem {
                                 visibleMax = 100
                             }
                             root.maxPing = Math.max(100, Math.ceil(visibleMax / 25) * 25)
-                            chartView.updateLiveLabels()
+                            if (root.chartDirty || rebuilt || axisChanged) {
+                                chartView.rebuildPathsAndExtrema()
+                                chartView.updateLiveLabels()
+                                root.chartDirty = false
+                            }
                         }
                     }
 
