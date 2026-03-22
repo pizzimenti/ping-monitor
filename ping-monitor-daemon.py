@@ -16,6 +16,7 @@ STATE_PATH = Path(f"/run/user/{os.getuid()}/ping-monitor-state")
 PING_FAST_S = 1.0
 PING_SLOW_S = 5.0
 GATEWAY_REFRESH_S = 30.0
+PING_TIMEOUT_S = 1.2
 
 PING_RE = re.compile(r"time[=<]([\d.]+)\s*ms", re.IGNORECASE)
 
@@ -100,10 +101,6 @@ class PingMonitorDaemon:
             "poll_interval_ms": int(PING_FAST_S * 1000),
             "consecutive_failure_cycles": 0,
         }
-        self.targets = ["cloudflare", "google", "gateway"]
-        self.target_index = 0
-        self.cycle_failures = 0
-        self.cycle_count = 0
         self.next_gateway_refresh = 0.0
 
     def stop(self, *_args) -> None:
@@ -120,27 +117,58 @@ class PingMonitorDaemon:
         self.state["gateway_ping"] = -1.0
         self.state["gateway_seq"] = int(self.state["gateway_seq"]) + 1
 
-    def sample_target(self, target: str) -> bool:
-        if target == "cloudflare":
-            ping_ms = parse_ping_ms(run_command(["ping", "-n", "-c", "1", "-W", "1", "1.1.1.1"]))
-            self.state["cloudflare_ping"] = ping_ms
-            self.state["cloudflare_seq"] = int(self.state["cloudflare_seq"]) + 1
-            return ping_ms >= 0
-        if target == "google":
-            ping_ms = parse_ping_ms(run_command(["ping", "-n", "-c", "1", "-W", "1", "8.8.8.8"]))
-            self.state["google_ping"] = ping_ms
-            self.state["google_seq"] = int(self.state["google_seq"]) + 1
-            return ping_ms >= 0
-
+    def sample_targets(self) -> int:
+        commands: dict[str, list[str] | None] = {
+            "cloudflare": ["ping", "-n", "-c", "1", "-W", "1", "1.1.1.1"],
+            "google": ["ping", "-n", "-c", "1", "-W", "1", "8.8.8.8"],
+            "gateway": None,
+        }
         gateway_ip = str(self.state["gateway_ip"])
-        if not gateway_ip:
-            self.state["gateway_ping"] = -1.0
-            self.state["gateway_seq"] = int(self.state["gateway_seq"]) + 1
-            return False
-        ping_ms = parse_ping_ms(run_command(["ping", "-n", "-c", "1", "-W", "1", gateway_ip]))
-        self.state["gateway_ping"] = ping_ms
-        self.state["gateway_seq"] = int(self.state["gateway_seq"]) + 1
-        return ping_ms >= 0
+        if gateway_ip:
+            commands["gateway"] = ["ping", "-n", "-c", "1", "-W", "1", gateway_ip]
+
+        processes: dict[str, subprocess.Popen[str]] = {}
+        for target, cmd in commands.items():
+            if cmd is None:
+                continue
+            try:
+                processes[target] = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except Exception:
+                pass
+
+        successes = 0
+        for target in ("cloudflare", "google", "gateway"):
+            seq_key = f"{target}_seq"
+            ping_key = f"{target}_ping"
+            self.state[seq_key] = int(self.state[seq_key]) + 1
+
+            proc = processes.get(target)
+            if proc is None:
+                self.state[ping_key] = -1.0
+                continue
+
+            try:
+                stdout, _ = proc.communicate(timeout=PING_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    stdout, _ = proc.communicate(timeout=0.2)
+                except Exception:
+                    stdout = ""
+            except Exception:
+                stdout = ""
+
+            ping_ms = parse_ping_ms(stdout)
+            self.state[ping_key] = ping_ms
+            if ping_ms >= 0:
+                successes += 1
+
+        return successes
 
     def complete_cycle(self, successes: int) -> None:
         if successes == 0:
@@ -160,18 +188,9 @@ class PingMonitorDaemon:
             loop_start = time.monotonic()
             now = time.time()
             self.refresh_gateway(loop_start)
-
-            target = self.targets[self.target_index]
-            success = self.sample_target(target)
+            successes = self.sample_targets()
             self.state["timestamp"] = int(now)
-            if not success:
-                self.cycle_failures += 1
-            self.target_index = (self.target_index + 1) % len(self.targets)
-            self.cycle_count += 1
-            if self.cycle_count >= len(self.targets):
-                self.complete_cycle(len(self.targets) - self.cycle_failures)
-                self.cycle_count = 0
-                self.cycle_failures = 0
+            self.complete_cycle(successes)
 
             write_state(self.state)
             interval = int(self.state["poll_interval_ms"]) / 1000.0
