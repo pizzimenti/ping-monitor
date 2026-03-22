@@ -20,6 +20,7 @@ It renders a rolling 90-second latency chart with live value labels.
 - KDE Plasma 6
 - `kpackagetool6`
 - `ping` and `ip` (typically provided by `iputils` and `iproute2`)
+- Python 3 (for the companion daemon)
 
 ## Installation
 
@@ -42,7 +43,7 @@ Use `--upgrade` instead of `--install` to update an existing install.
 ```bash
 git clone https://github.com/pizzimenti/plasma-ping-monitor.git
 cd plasma-ping-monitor
-kpackagetool6 --type Plasma/Applet --upgrade . || kpackagetool6 --type Plasma/Applet --install .
+bash install.sh
 ```
 
 Then reload Plasma Shell:
@@ -73,6 +74,12 @@ Lint QML:
 qmllint contents/ui/main.qml
 ```
 
+The widget now reads a shared runtime state file written by `ping-monitor-daemon.py`, so source installs should also keep the user service running:
+
+```bash
+systemctl --user status ping-monitor-daemon.service
+```
+
 After major QML or metadata changes:
 
 ```bash
@@ -98,6 +105,9 @@ kpackagetool6 --type Plasma/Applet --remove org.kde.plasma.pingmonitor
 - Widget not visible after install:
   - `kbuildsycoca6`
   - `systemctl --user restart plasma-plasmashell.service`
+- Daemon not updating state:
+  - `systemctl --user status ping-monitor-daemon.service`
+  - `journalctl --user -u ping-monitor-daemon.service -f`
 - Validate package metadata:
   - `kpackagetool6 --type Plasma/Applet --show org.kde.plasma.pingmonitor`
 - Validate UI syntax:

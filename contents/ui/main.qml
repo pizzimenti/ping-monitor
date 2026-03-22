@@ -1,9 +1,9 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Shapes
+import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
-import org.kde.plasma.plasma5support as P5Support
 import org.kde.kirigami as Kirigami
 
 PlasmoidItem {
@@ -37,7 +37,12 @@ PlasmoidItem {
     property real gatewayTo: -1
     property real gatewayStartTime: 0
     property bool chartDirty: false
-    property int consecutiveFailedPings: 0
+    readonly property string statePath: StandardPaths.writableLocation(StandardPaths.RuntimeLocation) + "/ping-monitor-state"
+    readonly property string stateUrl: "file://" + statePath
+    property int lastCloudflareSeq: -1
+    property int lastGoogleSeq: -1
+    property int lastGatewaySeq: -1
+    property int daemonTimestamp: 0
 
     property int windowSecs: 60
     readonly property var windowOptions: [
@@ -59,70 +64,9 @@ PlasmoidItem {
             && visible
             && Plasmoid.status !== PlasmaCore.Types.HiddenStatus
 
-    // One-shot ping commands, launched by timers.
-    readonly property string gatewayQueryCmd: "sh -c 'ip route show default 2>/dev/null | awk '\\''/default/ {print $3; exit}'\\'''"
     property string gatewayIp: ""
     property bool gatewayOnline: false
-    readonly property string cloudflarePingCmd: "ping -n -c 1 -W 1 1.1.1.1"
-    readonly property string googlePingCmd: "ping -n -c 1 -W 1 8.8.8.8"
-    property string gatewayPingCmd: gatewayIp.length > 0 ? "ping -n -c 1 -W 1 " + gatewayIp : ""
-    property bool cloudflarePingInFlight: false
-    property bool googlePingInFlight: false
-    property bool gatewayPingInFlight: false
-    property string gatewayPingCmdInFlight: ""
-    property int pingCycleIndex: 0
     property string lastPingReceivedText: "--:--:--"
-
-    function requestCloudflarePing() {
-        if (cloudflarePingInFlight) {
-            return
-        }
-        if (samplingActive) {
-            cloudflarePingInFlight = true
-            executable.connectSource(cloudflarePingCmd)
-        }
-    }
-
-    function requestGooglePing() {
-        if (googlePingInFlight) {
-            return
-        }
-        if (samplingActive) {
-            googlePingInFlight = true
-            executable.connectSource(googlePingCmd)
-        }
-    }
-
-    function requestGatewayPing() {
-        if (gatewayPingInFlight) {
-            return
-        }
-        if (samplingActive && gatewayIp.length > 0 && gatewayPingCmd.length > 0) {
-            gatewayPingInFlight = true
-            gatewayPingCmdInFlight = gatewayPingCmd
-            executable.connectSource(gatewayPingCmdInFlight)
-        }
-    }
-
-    function requestNextPing() {
-        if (!samplingActive) {
-            return
-        }
-        var target = pingCycleIndex
-        pingCycleIndex = (pingCycleIndex + 1) % 3
-
-        if (target === 0) {
-            requestCloudflarePing()
-        } else if (target === 1) {
-            requestGooglePing()
-        } else {
-            if (gatewayIp.length > 0) {
-                requestGatewayPing()
-            } else {
-                applyPing("gateway", -1)
-            }
-        }
-    }
 
     function updateGatewayIp(newIp) {
         var ip = (newIp || "").trim()
@@ -219,141 +163,82 @@ PlasmoidItem {
                 gatewayOnline = true
             }
         }
-        if (success) {
-            consecutiveFailedPings = 0
-            if (pingCycleTimer.interval !== 1000) {
-                pingCycleTimer.interval = 1000
-            }
-        } else {
-            consecutiveFailedPings += 1
-            if (consecutiveFailedPings >= 9 && pingCycleTimer.interval !== 5000) {
-                pingCycleTimer.interval = 5000
-            }
-        }
         chartDirty = true
     }
 
-    function cancelInFlightCommands() {
-        try { executable.disconnectSource(gatewayQueryCmd) } catch (e) {}
-        try { executable.disconnectSource(cloudflarePingCmd) } catch (e) {}
-        try { executable.disconnectSource(googlePingCmd) } catch (e) {}
-        try { if (gatewayPingCmdInFlight.length > 0) executable.disconnectSource(gatewayPingCmdInFlight) } catch (e) {}
-        cloudflarePingInFlight = false
-        googlePingInFlight = false
-        gatewayPingInFlight = false
-        gatewayPingCmdInFlight = ""
-    }
-
-    function processPingLine(line, target) {
-        if (!line || line.length === 0) {
-            return false
-        }
-
-        var match = line.match(/time[=<]([\d.]+)\s*ms/)
-        if (match) {
-            applyPing(target, parseFloat(match[1]))
-            return true
-        }
-
-        var lower = line.toLowerCase()
-        if (lower.indexOf("no answer yet") !== -1
-                || lower.indexOf("timeout") !== -1
-                || lower.indexOf("unreachable") !== -1
-                || lower.indexOf("100% packet loss") !== -1) {
-            applyPing(target, -1)
-            return true
-        }
-        return false
-    }
-
-    function processPingSnapshot(stdout, target) {
-        var lines = stdout.split(/\r?\n/)
-        for (var i = lines.length - 1; i >= 0; --i) {
-            var line = lines[i]
-            if (!line || line.length === 0) {
-                continue
+    function parseStateSnapshot(rawText) {
+        const next = {
+            timestamp: 0,
+            gateway_ip: "",
+            cloudflare_ping: -1,
+            cloudflare_seq: -1,
+            google_ping: -1,
+            google_seq: -1,
+            gateway_ping: -1,
+            gateway_seq: -1
+        };
+        for (const line of (rawText || "").split(/\r?\n/)) {
+            if (!line || !line.includes("=")) {
+                continue;
             }
-            var m = line.match(/time[=<]([\d.]+)\s*ms/)
-            var l = line.toLowerCase()
-            var timeoutish = (l.indexOf("no answer yet") !== -1
-                    || l.indexOf("timeout") !== -1
-                    || l.indexOf("unreachable") !== -1
-                    || l.indexOf("100% packet loss") !== -1)
-            if (!m && !timeoutish) {
-                continue
-            }
-
-            if (processPingLine(line, target)) {
-                return true
+            const idx = line.indexOf("=");
+            const key = line.slice(0, idx);
+            const value = line.slice(idx + 1);
+            if (key === "timestamp") {
+                next.timestamp = parseInt(value, 10) || 0;
+            } else if (key === "gateway_ip") {
+                next.gateway_ip = value;
+            } else if (key === "cloudflare_ping") {
+                next.cloudflare_ping = parseFloat(value);
+            } else if (key === "cloudflare_seq") {
+                next.cloudflare_seq = parseInt(value, 10) || 0;
+            } else if (key === "google_ping") {
+                next.google_ping = parseFloat(value);
+            } else if (key === "google_seq") {
+                next.google_seq = parseInt(value, 10) || 0;
+            } else if (key === "gateway_ping") {
+                next.gateway_ping = parseFloat(value);
+            } else if (key === "gateway_seq") {
+                next.gateway_seq = parseInt(value, 10) || 0;
             }
         }
-        return false
-    }
 
-    // Plasma executable engine runs ping commands asynchronously.
-    P5Support.DataSource {
-        id: executable
-        engine: "executable"
-        connectedSources: []
+        daemonTimestamp = next.timestamp;
+        updateGatewayIp(next.gateway_ip);
 
-        onNewData: function(source, data) {
-            var stdout = data["stdout"] || ""
-            if (source === root.gatewayQueryCmd) {
-                root.updateGatewayIp(stdout)
-            } else if (source === root.cloudflarePingCmd) {
-                root.cloudflarePingInFlight = false
-                if (!root.processPingSnapshot(stdout, "cloudflare")) {
-                    root.applyPing("cloudflare", -1)
-                }
-            } else if (source === root.googlePingCmd) {
-                root.googlePingInFlight = false
-                if (!root.processPingSnapshot(stdout, "google")) {
-                    root.applyPing("google", -1)
-                }
-            } else if (source === root.gatewayPingCmdInFlight) {
-                root.gatewayPingInFlight = false
-                var requestedSource = root.gatewayPingCmdInFlight
-                root.gatewayPingCmdInFlight = ""
-                if (requestedSource === root.gatewayPingCmd) {
-                    if (!root.processPingSnapshot(stdout, "gateway")) {
-                        root.applyPing("gateway", -1)
-                    }
-                }
-            }
-            executable.disconnectSource(source)
+        if (next.cloudflare_seq > lastCloudflareSeq) {
+            lastCloudflareSeq = next.cloudflare_seq;
+            applyPing("cloudflare", isNaN(next.cloudflare_ping) ? -1 : next.cloudflare_ping);
+        }
+        if (next.google_seq > lastGoogleSeq) {
+            lastGoogleSeq = next.google_seq;
+            applyPing("google", isNaN(next.google_ping) ? -1 : next.google_ping);
+        }
+        if (next.gateway_seq > lastGatewaySeq) {
+            lastGatewaySeq = next.gateway_seq;
+            applyPing("gateway", isNaN(next.gateway_ping) ? -1 : next.gateway_ping);
         }
     }
 
-    // Refresh gateway IP periodically to keep route changes in sync.
-    Timer {
-        id: gatewayRefreshTimer
-        interval: 30000
-        running: root.samplingActive
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: {
-            if (root.samplingActive) {
-                executable.connectSource(root.gatewayQueryCmd)
-            }
-        }
-    }
-
-    // One-shot ping loop: one provider ping per second (3-second full cycle).
-    Timer {
-        id: pingCycleTimer
-        interval: 1000
-        running: root.samplingActive
-        repeat: true
-        triggeredOnStart: true
-        onTriggered: {
-            root.requestNextPing()
-        }
-    }
-
-    onSamplingActiveChanged: {
+    function readStateFile() {
         if (!samplingActive) {
-            cancelInFlightCommands()
+            return;
         }
+        const xhr = new XMLHttpRequest();
+        xhr.open("GET", stateUrl, false);
+        xhr.send();
+        if (xhr.status === 0 || xhr.status === 200) {
+            parseStateSnapshot(xhr.responseText || "");
+        }
+    }
+
+    Timer {
+        id: statePollTimer
+        interval: root.expanded ? 1000 : 5000
+        running: root.samplingActive
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.readStateFile()
     }
 
     fullRepresentation: Item {
@@ -1263,10 +1148,7 @@ PlasmoidItem {
     }
 
     Component.onDestruction: {
-        // Explicitly stop timers and disconnect any in-flight one-shot commands.
         shuttingDown = true
-        try { if (gatewayRefreshTimer) gatewayRefreshTimer.stop() } catch (e) {}
-        try { if (pingCycleTimer) pingCycleTimer.stop() } catch (e) {}
-        cancelInFlightCommands()
+        try { if (statePollTimer) statePollTimer.stop() } catch (e) {}
     }
 }
