@@ -202,7 +202,7 @@ PlasmoidItem {
 
     Timer {
         id: statePollTimer
-        interval: root.expanded ? 1000 : 5000
+        interval: 1000
         running: root.samplingActive
         repeat: true
         triggeredOnStart: true
