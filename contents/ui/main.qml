@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Shapes
-import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.plasma5support as Plasma5Support
@@ -28,17 +27,17 @@ PlasmoidItem {
     property real displayGatewayPing: -1
 
     property bool chartDirty: false
-    // Build "cat /run/user/<uid>/ping-monitor-state" once at startup. cat is a
-    // few-millisecond fork (no Python interpreter, no venv) so the executable
-    // engine stays cheap. We can't use XMLHttpRequest against file:// URLs in
-    // Qt 6 — it's blocked unless QML_XHR_ALLOW_FILE_READ=1 is set in
-    // plasmashell's environment, which would be a global side effect.
-    readonly property string runtimeDir: StandardPaths.writableLocation(StandardPaths.RuntimeLocation).toString().replace(/^file:\/\//, "")
-    readonly property string currentCommand: "cat " + runtimeDir + "/ping-monitor-state"
-    property int lastCloudflareSeq: -1
-    property int lastGoogleSeq: -1
-    property int lastGatewaySeq: -1
-    property int daemonTimestamp: 0
+
+    // Fixed ping targets. The plasmoid spawns a short-lived `ping -c 1 -W 1`
+    // for each of these once per second; no daemon, no state file. -W 1 caps
+    // each fork at ~1.2s so cleanup is automatic — even if disconnectSource
+    // failed to kill a child, nothing lingers.
+    readonly property string cloudflareHost: "1.1.1.1"
+    readonly property string googleHost: "8.8.8.8"
+    readonly property string cloudflareCommand: "ping -n -c 1 -W 1 " + cloudflareHost
+    readonly property string googleCommand: "ping -n -c 1 -W 1 " + googleHost
+    property string gatewayCommand: ""
+    readonly property string gatewayLookupCommand: "ip -4 route show default"
 
     property int windowSecs: 60
     readonly property var windowOptions: [
@@ -144,87 +143,85 @@ PlasmoidItem {
         chartDirty = true
     }
 
-    function parseStateSnapshot(rawText) {
-        const next = {
-            timestamp: 0,
-            gateway_ip: "",
-            cloudflare_ping: -1,
-            cloudflare_seq: -1,
-            google_ping: -1,
-            google_seq: -1,
-            gateway_ping: -1,
-            gateway_seq: -1
-        };
-        for (const line of (rawText || "").split(/\r?\n/)) {
-            if (!line || !line.includes("=")) {
-                continue;
-            }
-            const idx = line.indexOf("=");
-            const key = line.slice(0, idx);
-            const value = line.slice(idx + 1);
-            if (key === "timestamp") {
-                next.timestamp = parseInt(value, 10) || 0;
-            } else if (key === "gateway_ip") {
-                next.gateway_ip = value;
-            } else if (key === "cloudflare_ping") {
-                next.cloudflare_ping = parseFloat(value);
-            } else if (key === "cloudflare_seq") {
-                next.cloudflare_seq = parseInt(value, 10) || 0;
-            } else if (key === "google_ping") {
-                next.google_ping = parseFloat(value);
-            } else if (key === "google_seq") {
-                next.google_seq = parseInt(value, 10) || 0;
-            } else if (key === "gateway_ping") {
-                next.gateway_ping = parseFloat(value);
-            } else if (key === "gateway_seq") {
-                next.gateway_seq = parseInt(value, 10) || 0;
-            }
+    // Parse the first "time=X ms" (or "time<X ms") field from a `ping -c 1`
+    // stdout chunk. Returns -1 for timeout/unreachable/parse failure.
+    function parsePingMs(rawText) {
+        const text = rawText || "";
+        const lower = text.toLowerCase();
+        if (lower.indexOf("100% packet loss") !== -1
+                || lower.indexOf("unreachable") !== -1
+                || lower.indexOf("no answer yet") !== -1) {
+            return -1;
         }
-
-        daemonTimestamp = next.timestamp;
-        updateGatewayIp(next.gateway_ip);
-
-        if (next.cloudflare_seq > lastCloudflareSeq) {
-            lastCloudflareSeq = next.cloudflare_seq;
-            applyPing("cloudflare", isNaN(next.cloudflare_ping) ? -1 : next.cloudflare_ping);
+        const match = text.match(/time[=<]([\d.]+)\s*ms/i);
+        if (!match) {
+            return -1;
         }
-        if (next.google_seq > lastGoogleSeq) {
-            lastGoogleSeq = next.google_seq;
-            applyPing("google", isNaN(next.google_ping) ? -1 : next.google_ping);
+        const value = parseFloat(match[1]);
+        if (isNaN(value) || value < 0) {
+            return -1;
         }
-        if (next.gateway_seq > lastGatewaySeq) {
-            lastGatewaySeq = next.gateway_seq;
-            applyPing("gateway", isNaN(next.gateway_ping) ? -1 : next.gateway_ping);
-        }
+        return value;
     }
 
-    function readStateFile() {
+    // Pull the gateway IP out of `ip -4 route show default` output.
+    function parseGatewayIp(rawText) {
+        const lines = (rawText || "").split(/\r?\n/);
+        for (const line of lines) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 3 && parts[0] === "default" && parts[1] === "via") {
+                return parts[2];
+            }
+        }
+        return "";
+    }
+
+    function spawnPing(command) {
+        if (!command) {
+            return;
+        }
+        // Re-connecting an already-connected source is a no-op for the engine
+        // but the disconnect-then-connect dance forces a fresh run. -W 1 caps
+        // the in-flight ping at ~1.2s so even back-to-back ticks won't pile up.
+        executableSource.disconnectSource(command);
+        executableSource.connectSource(command);
+    }
+
+    function pingAllTargets() {
         if (!samplingActive) {
             return;
         }
-        if (!runtimeDir) {
-            // RuntimeLocation was unavailable at startup; warned in
-            // Component.onCompleted, no point in firing cat against /.
-            return;
+        spawnPing(cloudflareCommand);
+        spawnPing(googleCommand);
+        if (gatewayCommand.length > 0) {
+            spawnPing(gatewayCommand);
         }
-        executableSource.disconnectSource(currentCommand);
-        executableSource.connectSource(currentCommand);
     }
 
-    Component.onCompleted: {
-        if (!runtimeDir) {
-            console.warn("ping-monitor: StandardPaths.RuntimeLocation is empty;",
-                         "state polling disabled until plasmashell restart");
+    function refreshGateway() {
+        if (!samplingActive) {
+            return;
         }
+        executableSource.disconnectSource(gatewayLookupCommand);
+        executableSource.connectSource(gatewayLookupCommand);
     }
 
     Timer {
-        id: statePollTimer
+        id: pingTimer
         interval: 1000
         running: root.samplingActive
         repeat: true
         triggeredOnStart: true
-        onTriggered: root.readStateFile()
+        onTriggered: root.pingAllTargets()
+    }
+
+    Timer {
+        id: gatewayRefreshTimer
+        interval: 30000
+        running: root.samplingActive
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.refreshGateway()
     }
 
     Plasma5Support.DataSource {
@@ -232,10 +229,20 @@ PlasmoidItem {
         engine: "executable"
         interval: 0
         onNewData: (sourceName, sourceData) => {
-            if (sourceName !== root.currentCommand) {
-                return;
+            const stdout = sourceData["stdout"] || "";
+            if (sourceName === root.cloudflareCommand) {
+                root.applyPing("cloudflare", root.parsePingMs(stdout));
+            } else if (sourceName === root.googleCommand) {
+                root.applyPing("google", root.parsePingMs(stdout));
+            } else if (sourceName === root.gatewayLookupCommand) {
+                const ip = root.parseGatewayIp(stdout);
+                root.updateGatewayIp(ip);
+                root.gatewayCommand = ip.length > 0
+                        ? "ping -n -c 1 -W 1 " + ip
+                        : "";
+            } else if (sourceName === root.gatewayCommand && root.gatewayCommand.length > 0) {
+                root.applyPing("gateway", root.parsePingMs(stdout));
             }
-            root.parseStateSnapshot(sourceData.stdout || "");
             executableSource.disconnectSource(sourceName);
         }
     }
@@ -1184,6 +1191,19 @@ PlasmoidItem {
 
     Component.onDestruction: {
         shuttingDown = true
-        try { if (statePollTimer) statePollTimer.stop() } catch (e) {}
+        try { if (pingTimer) pingTimer.stop() } catch (e) {}
+        try { if (gatewayRefreshTimer) gatewayRefreshTimer.stop() } catch (e) {}
+        // Best-effort cleanup of any in-flight ping forks. With -W 1 each ping
+        // self-terminates inside ~1.2s anyway, so this is belt-and-suspenders.
+        try {
+            if (executableSource) {
+                executableSource.disconnectSource(cloudflareCommand)
+                executableSource.disconnectSource(googleCommand)
+                executableSource.disconnectSource(gatewayLookupCommand)
+                if (gatewayCommand.length > 0) {
+                    executableSource.disconnectSource(gatewayCommand)
+                }
+            }
+        } catch (e) {}
     }
 }
