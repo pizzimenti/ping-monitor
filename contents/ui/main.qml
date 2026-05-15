@@ -18,6 +18,12 @@ PlasmoidItem {
 
     preferredRepresentation: isDesktopForm ? fullRepresentation : compactRepresentation
 
+    // Only shows up when the widget is in a panel (compactRepresentation
+    // active). On the desktop the full chart is visible so a tooltip would
+    // just be noise.
+    toolTipMainText: isDesktopForm ? "" : "Ping Monitor"
+    toolTipSubText: isDesktopForm ? "" : "This widget is desktop-only. Right-click to remove it from the panel and add it to the desktop instead."
+
     // Latest parsed ping values (ms); -1 means timeout/unavailable.
     property real currentCloudflarePing: -1
     property real currentGooglePing: -1
@@ -263,9 +269,6 @@ PlasmoidItem {
         Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
         Layout.minimumWidth: Kirigami.Units.iconSizes.small
         Layout.minimumHeight: Kirigami.Units.iconSizes.small
-
-        Plasmoid.toolTipMainText: "Ping Monitor"
-        Plasmoid.toolTipSubText: "This widget is desktop-only. Right-click to remove it from the panel and add it to the desktop instead."
 
         Kirigami.Icon {
             anchors.fill: parent
