@@ -3,52 +3,26 @@ import QtQuick.Layouts
 import QtQuick.Shapes
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
+import org.kde.plasma.extras as PlasmaExtras
 import org.kde.plasma.plasma5support as Plasma5Support
 import org.kde.kirigami as Kirigami
 
 PlasmoidItem {
     id: root
 
-    // metadata.json restricts FormFactors to ["desktop"] so the Add Widgets
-    // dialog hides this from panel contexts, but enforcement varies by Plasma
-    // version. Treat any non-Planar form factor (horizontal/vertical panel,
-    // mediacenter, application) as "wrong place" and fall back to a compact
-    // "remove me" representation that does no sampling.
-    readonly property bool isDesktopForm: Plasmoid.formFactor === PlasmaCore.Types.Planar
+    // Panel widget: tray icon by default, popup chart on click. Mirrors the
+    // wifimimo / audiomux / dell-fans pattern in this widget family.
+    preferredRepresentation: compactRepresentation
 
-    preferredRepresentation: isDesktopForm ? fullRepresentation : compactRepresentation
-
-    // Only shows up briefly while the panel-eject timer fires; the tooltip
-    // explains the situation if the auto-remove fails for any reason.
-    toolTipMainText: isDesktopForm ? "" : "Ping Monitor"
-    toolTipSubText: isDesktopForm ? "" : "This widget is desktop-only. Removing from panel — add it to the desktop instead."
-
-    // Plasma 6's Add Widgets dialog does not honour FormFactors=["desktop"]
-    // as a hard filter, so a user can still drop the plasmoid into a panel.
-    // When that happens, request our own removal via the same action the
-    // context menu uses. 100 ms delay lets the applet finish initialising
-    // before we ask plasmashell to detach us — triggering during
-    // Component.onCompleted leaves stale half-initialised state behind.
-    Timer {
-        id: panelEjectTimer
-        interval: 100
-        repeat: false
-        onTriggered: {
-            var action = Plasmoid.internalAction("remove")
-            if (action) {
-                console.warn("Ping Monitor: refusing panel placement (formFactor=" + Plasmoid.formFactor + "); auto-removing.")
-                action.trigger()
-            } else {
-                console.warn("Ping Monitor: in panel form but Plasmoid.internalAction(\"remove\") is unavailable; staying as compact warning icon.")
-            }
-        }
-    }
-
-    Component.onCompleted: {
-        if (!isDesktopForm) {
-            panelEjectTimer.start()
-        }
-    }
+    // Two cadences, switched by Plasmoid.expanded:
+    //   - fast (1 Hz) while the popup is open: drives the live chart.
+    //   - slow (every 10 s) while collapsed: just enough to keep the tray
+    //     icon's tier (good/warn/alert/disabled) honest. History pushes
+    //     happen at the slow rate too, so the chart re-opens with the last
+    //     hour of background samples already in it.
+    readonly property int fastPingMs: 1000
+    readonly property int slowPingMs: 10000
+    readonly property int currentPingInterval: Plasmoid.expanded ? fastPingMs : slowPingMs
 
     // Latest parsed ping values (ms); -1 means timeout/unavailable.
     property real currentCloudflarePing: -1
@@ -94,13 +68,87 @@ PlasmoidItem {
 
     property bool shuttingDown: false
     readonly property bool samplingActive: !shuttingDown
-            && visible
-            && isDesktopForm
             && Plasmoid.status !== PlasmaCore.Types.HiddenStatus
 
     property string gatewayIp: ""
     property bool gatewayOnline: false
     property string lastPingReceivedText: "--:--:--"
+
+    // --- Icon-tier state machine ----------------------------------------
+    // alert    : both 1.1.1.1 and 8.8.8.8 timing out (internet unreachable).
+    // warn     : one of cloudflare/google timing out OR fastest latency > warnLatencyMs.
+    // good     : both responding, fastest latency ≤ warnLatencyMs.
+    // disabled : no data yet (just started, slow-poll hasn't returned).
+    // Threshold sized for "is something wrong": typical residential
+    // internet sits 5–40 ms, datacenter access 1–10 ms. 150 ms is well
+    // above normal but below pathologically broken, so it catches
+    // congestion/wifi issues without crying wolf on a transient spike.
+    readonly property int warnLatencyMs: 150
+
+    readonly property bool cloudflareUp: currentCloudflarePing >= 0
+    readonly property bool googleUp: currentGooglePing >= 0
+    readonly property real fastestInternetPing: {
+        if (cloudflareUp && googleUp) {
+            return Math.min(currentCloudflarePing, currentGooglePing)
+        }
+        if (cloudflareUp) {
+            return currentCloudflarePing
+        }
+        if (googleUp) {
+            return currentGooglePing
+        }
+        return -1
+    }
+    readonly property bool hasAnyData: cloudflareUp || googleUp || currentGatewayPing >= 0
+
+    readonly property string iconTier: {
+        if (!hasAnyData) {
+            return "disabled"
+        }
+        if (!cloudflareUp && !googleUp) {
+            return "alert"
+        }
+        if (!cloudflareUp || !googleUp || fastestInternetPing > warnLatencyMs) {
+            return "warn"
+        }
+        return "good"
+    }
+    readonly property color iconColor: {
+        if (iconTier === "alert") {
+            return Kirigami.Theme.negativeTextColor
+        }
+        if (iconTier === "warn") {
+            return Kirigami.Theme.neutralTextColor
+        }
+        if (iconTier === "good") {
+            return Kirigami.Theme.positiveTextColor
+        }
+        return Kirigami.Theme.textColor
+    }
+    readonly property real iconOpacity: iconTier === "disabled" ? 0.45 : 1.0
+
+    Plasmoid.icon: "chronometer"
+    // Alert tier forces the icon out of the auto-hide tray section so an
+    // outage is actually visible. Other tiers stay Active so the icon is
+    // always present but doesn't push past the system-tray collapse.
+    Plasmoid.status: iconTier === "alert"
+            ? PlasmaCore.Types.NeedsAttentionStatus
+            : PlasmaCore.Types.ActiveStatus
+
+    toolTipMainText: "Ping Monitor"
+    toolTipSubText: {
+        if (!hasAnyData) {
+            return "Waiting for first sample…"
+        }
+        var lines = []
+        lines.push("1.1.1.1: " + (cloudflareUp ? currentCloudflarePing.toFixed(0) + " ms" : "timeout"))
+        lines.push("8.8.8.8: " + (googleUp ? currentGooglePing.toFixed(0) + " ms" : "timeout"))
+        if (gatewayIp.length > 0) {
+            lines.push(gatewayIp + ": " + (currentGatewayPing >= 0 ? currentGatewayPing.toFixed(0) + " ms" : "timeout"))
+        }
+        return lines.join("\n")
+    }
+    toolTipTextFormat: Text.PlainText
 
     function updateGatewayIp(newIp) {
         var ip = (newIp || "").trim()
@@ -247,7 +295,7 @@ PlasmoidItem {
 
     Timer {
         id: pingTimer
-        interval: 1000
+        interval: root.currentPingInterval
         running: root.samplingActive
         repeat: true
         triggeredOnStart: true
@@ -286,27 +334,31 @@ PlasmoidItem {
         }
     }
 
-    // Shown when the widget is placed somewhere other than the desktop
-    // (horizontal/vertical panel, mediacenter, application). Kept tiny so it
-    // doesn't crowd the panel; the icon-only tooltip explains the situation
-    // and the user can right-click → Remove.
-    compactRepresentation: Item {
-        Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
-        Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
-        Layout.minimumWidth: Kirigami.Units.iconSizes.small
-        Layout.minimumHeight: Kirigami.Units.iconSizes.small
+    // Tray icon — colored chronometer that flips between the four iconTier
+    // colors. Click toggles the popup chart.
+    compactRepresentation: MouseArea {
+        acceptedButtons: Qt.LeftButton
+        implicitWidth: Kirigami.Units.iconSizes.smallMedium
+        implicitHeight: Kirigami.Units.iconSizes.smallMedium
+        onClicked: root.expanded = !root.expanded
 
         Kirigami.Icon {
             anchors.fill: parent
-            source: "dialog-warning"
+            anchors.margins: 1
+            source: "chronometer"
+            isMask: true
+            color: root.iconColor
+            opacity: root.iconOpacity
+            active: root.expanded
         }
     }
 
-    fullRepresentation: Item {
-        Layout.preferredWidth: Kirigami.Units.gridUnit * 18
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 10
-        Layout.minimumWidth: Kirigami.Units.gridUnit * 12
-        Layout.minimumHeight: Kirigami.Units.gridUnit * 6
+    fullRepresentation: PlasmaExtras.Representation {
+        Layout.minimumWidth: Kirigami.Units.gridUnit * 30
+        Layout.minimumHeight: Kirigami.Units.gridUnit * 14
+        Layout.preferredWidth: Kirigami.Units.gridUnit * 36
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 16
+        collapseMarginsHint: true
 
         Rectangle {
             anchors.fill: parent
@@ -957,13 +1009,25 @@ PlasmoidItem {
                         onTriggered: chartView.refreshVisibleFromHistory()
                     }
 
+                    // History keeps filling at the pingTimer cadence (1 s
+                    // expanded / 10 s collapsed) so the chart re-opens with
+                    // recent data already buffered. Path rebuilds and the
+                    // axis easing only happen while the popup is expanded —
+                    // there's no point spending CPU painting an invisible
+                    // chart.
                     Timer {
                         id: chartUpdateTimer
-                        interval: 1000
+                        interval: root.currentPingInterval
                         repeat: true
-                        running: chartView.visible && root.samplingActive
+                        running: root.samplingActive
                         onTriggered: {
                             var now = Date.now()
+                            chartView.pushHistorySample(now)
+
+                            if (!root.expanded || !chartView.visible) {
+                                return
+                            }
+
                             var oldAxisTop = root.axisTopMs()
 
                             var maxDelta = root.maxPing - root.displayMaxPing
@@ -978,7 +1042,6 @@ PlasmoidItem {
                                 chartView.scrollAccPoints = 0
                                 rebuilt = true
                             }
-                            chartView.pushHistorySample(now)
                             var pointsPerTick = (chartView.pointCount > 0) ? (chartView.pointCount / root.windowSecs) : 0
                             chartView.scrollAccPoints += pointsPerTick
                             var ds = Math.floor(chartView.scrollAccPoints)
@@ -1009,6 +1072,19 @@ PlasmoidItem {
                                 chartView.rebuildPathsAndExtrema()
                                 chartView.updateLiveLabels()
                                 root.chartDirty = false
+                            }
+                        }
+                    }
+
+                    // Catch-up render when the popup is reopened after a
+                    // collapsed stretch — `chartUpdateTimer` was skipping
+                    // path rebuilds, so the chart visuals are stale relative
+                    // to what's now in the history ring buffer.
+                    Connections {
+                        target: root
+                        function onExpandedChanged() {
+                            if (root.expanded) {
+                                chartView.refreshVisibleFromHistory()
                             }
                         }
                     }
