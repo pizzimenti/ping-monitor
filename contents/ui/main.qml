@@ -357,15 +357,20 @@ PlasmoidItem {
 
     // Tray icon — colored satellite (from kstars's icon set) that flips
     // between the four iconTier colors. Click toggles the popup chart.
+    // Layout.fillHeight makes the icon scale up to the panel's available
+    // height instead of staying pinned at a small 22 px hint; the
+    // kstars_satellites SVG has enough whitespace inside its 22×22
+    // viewBox that smallMedium felt visibly underweight next to the
+    // sibling applets in the tray.
     compactRepresentation: MouseArea {
         acceptedButtons: Qt.LeftButton
-        implicitWidth: Kirigami.Units.iconSizes.smallMedium
-        implicitHeight: Kirigami.Units.iconSizes.smallMedium
+        Layout.fillHeight: true
+        Layout.minimumWidth: height
+        Layout.preferredWidth: height
         onClicked: root.expanded = !root.expanded
 
         Kirigami.Icon {
             anchors.fill: parent
-            anchors.margins: 1
             source: "kstars_satellites"
             isMask: true
             color: root.iconColor
