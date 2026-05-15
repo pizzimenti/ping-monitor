@@ -18,11 +18,37 @@ PlasmoidItem {
 
     preferredRepresentation: isDesktopForm ? fullRepresentation : compactRepresentation
 
-    // Only shows up when the widget is in a panel (compactRepresentation
-    // active). On the desktop the full chart is visible so a tooltip would
-    // just be noise.
+    // Only shows up briefly while the panel-eject timer fires; the tooltip
+    // explains the situation if the auto-remove fails for any reason.
     toolTipMainText: isDesktopForm ? "" : "Ping Monitor"
-    toolTipSubText: isDesktopForm ? "" : "This widget is desktop-only. Right-click to remove it from the panel and add it to the desktop instead."
+    toolTipSubText: isDesktopForm ? "" : "This widget is desktop-only. Removing from panel — add it to the desktop instead."
+
+    // Plasma 6's Add Widgets dialog does not honour FormFactors=["desktop"]
+    // as a hard filter, so a user can still drop the plasmoid into a panel.
+    // When that happens, request our own removal via the same action the
+    // context menu uses. 100 ms delay lets the applet finish initialising
+    // before we ask plasmashell to detach us — triggering during
+    // Component.onCompleted leaves stale half-initialised state behind.
+    Timer {
+        id: panelEjectTimer
+        interval: 100
+        repeat: false
+        onTriggered: {
+            var action = Plasmoid.internalAction("remove")
+            if (action) {
+                console.warn("Ping Monitor: refusing panel placement (formFactor=" + Plasmoid.formFactor + "); auto-removing.")
+                action.trigger()
+            } else {
+                console.warn("Ping Monitor: in panel form but Plasmoid.internalAction(\"remove\") is unavailable; staying as compact warning icon.")
+            }
+        }
+    }
+
+    Component.onCompleted: {
+        if (!isDesktopForm) {
+            panelEjectTimer.start()
+        }
+    }
 
     // Latest parsed ping values (ms); -1 means timeout/unavailable.
     property real currentCloudflarePing: -1
