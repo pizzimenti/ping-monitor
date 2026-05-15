@@ -1,36 +1,45 @@
 # Ping Monitor
 
-KDE Plasma 6 widget that monitors latency to:
+KDE Plasma 6 system-tray widget that quietly watches latency to:
 - Cloudflare (`1.1.1.1`)
 - Google DNS (`8.8.8.8`)
-- Your default gateway (optional, auto-detected)
+- Your default gateway (auto-detected via `ip -4 route`)
 
-It renders a rolling 90-second latency chart with live value labels.
+A colored satellite icon in the panel summarizes connectivity state at a
+glance; click it for a popup with the rolling-window latency chart.
 
 ## Features
 
-- Rolling 90s RTT chart for internet and gateway targets
-- Public ping cadence: 1 second per host, staggered by 500 ms
-- Gateway ping cadence: 500 ms
-- Automatic stale-stream recovery for public ping processes
-- Max/min markers for internet series (gateway excluded)
+- **At-a-glance status** via a four-tier colored icon driven by
+  Kirigami theme colors:
+  - `good` (positive / green) — both public targets up, fastest
+    internet RTT ≤ 150 ms.
+  - `warn` (neutral / amber) — one of the public targets timing out,
+    or fastest RTT > 150 ms.
+  - `alert` (negative / red) — both public targets unreachable. Plasma
+    is asked to surface the icon via `NeedsAttentionStatus`.
+  - `disabled` (theme text @ 45 % opacity) — no recent samples yet.
+- **Expansion-driven cadence.** Three `ping -c 1 -W 1` forks per cycle,
+  at 1 s while the popup is open and 5 s while collapsed. The 5 s
+  background poll keeps the icon honest and slowly fills the in-memory
+  history ring so reopening the popup shows a populated chart.
+- **Rolling latency chart** with selectable windows (1 / 5 / 10 / 30 /
+  60 min), max / min markers on the internet series, and per-host live
+  value labels.
+- **Tooltip with per-host latency** when you hover the tray icon.
+- **No daemon, no state file, no Python dependency.** The widget owns
+  its own ping forks; closing or removing it stops all sampling. Each
+  `ping` self-terminates inside ~1.2 s thanks to `-W 1`.
 
 ## Requirements
 
-- KDE Plasma 6
+- KDE Plasma 6 (`X-Plasma-API-Minimum-Version: 6.0`)
 - `kpackagetool6`
 - `ping` and `ip` (typically provided by `iputils` and `iproute2`)
-- Python 3 (for the companion daemon)
 
 ## Installation
 
-### Method 1: KDE Store (recommended)
-
-1. Right-click Desktop or Panel -> Add Widgets.
-2. Click `Get New Widgets...`.
-3. Search for `Ping Monitor` and install.
-
-### Method 2: Install local `.plasmoid` package
+### Method 1: Install local `.plasmoid` package
 
 ```bash
 kpackagetool6 --type Plasma/Applet --install /path/to/org.kde.plasma.pingmonitor-1.0.2.plasmoid
@@ -38,13 +47,18 @@ kpackagetool6 --type Plasma/Applet --install /path/to/org.kde.plasma.pingmonitor
 
 Use `--upgrade` instead of `--install` to update an existing install.
 
-### Method 3: Install from source checkout
+### Method 2: Install from source checkout
 
 ```bash
-git clone https://github.com/pizzimenti/plasma-ping-monitor.git
-cd plasma-ping-monitor
+git clone https://github.com/pizzimenti/ping-monitor.git
+cd ping-monitor
 bash install.sh
 ```
+
+`install.sh` idempotently tears down any leftover `ping-monitor-daemon`
+systemd unit and `/usr/local/lib/ping-monitor` helper files from prior
+daemon-based installs (only requesting a `pkexec` elevation when those
+legacy files are actually present).
 
 Then reload Plasma Shell:
 
@@ -54,18 +68,21 @@ systemctl --user restart plasma-plasmashell.service
 
 ## Usage
 
-1. Right-click Desktop or Panel -> Add Widgets.
+1. Right-click the panel → Add Widgets.
 2. Search for `Ping Monitor`.
-3. Add it to your desktop or panel.
+3. Drop it onto the panel. The widget declares
+   `FormFactors: ["horizontal", "vertical"]`, so it lives in panels —
+   not on the desktop.
+4. Click the satellite icon to expand the latency chart popup; click
+   again (or click away) to collapse. Hover for a per-host latency
+   tooltip.
 
 ## Development
 
 Quick preview:
 
 ```bash
-plasmawindowed .
-# or
-plasmoidviewer .
+plasmoidviewer --applet org.kde.plasma.pingmonitor
 ```
 
 Lint QML:
@@ -74,16 +91,18 @@ Lint QML:
 qmllint contents/ui/main.qml
 ```
 
-The widget now reads a shared runtime state file written by `ping-monitor-daemon.py`, so source installs should also keep the user service running:
-
-```bash
-systemctl --user status ping-monitor-daemon.service
-```
-
 After major QML or metadata changes:
 
 ```bash
 systemctl --user restart plasma-plasmashell.service
+```
+
+If plasmashell aggressively caches plugin metadata, a harder restart
+clears it:
+
+```bash
+kbuildsycoca6 --noincremental
+kquitapp6 plasmashell && kstart plasmashell
 ```
 
 ## Packaging
@@ -102,12 +121,13 @@ kpackagetool6 --type Plasma/Applet --remove org.kde.plasma.pingmonitor
 
 ## Troubleshooting
 
-- Widget not visible after install:
-  - `kbuildsycoca6`
-  - `systemctl --user restart plasma-plasmashell.service`
-- Daemon not updating state:
-  - `systemctl --user status ping-monitor-daemon.service`
-  - `journalctl --user -u ping-monitor-daemon.service -f`
+- Widget not visible in Add Widgets after install:
+  - `kbuildsycoca6 --noincremental`
+  - `kquitapp6 plasmashell && kstart plasmashell`
+- Icon stays grey forever (`disabled` tier):
+  - Run `ping -c 1 -W 1 1.1.1.1` manually; if that fails the widget
+    can't be expected to succeed either.
+  - `journalctl --user -t plasmashell | grep ping-monitor`.
 - Validate package metadata:
   - `kpackagetool6 --type Plasma/Applet --show org.kde.plasma.pingmonitor`
 - Validate UI syntax:
