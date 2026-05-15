@@ -2,73 +2,96 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 SERVICE_NAME="ping-monitor-daemon.service"
 PLASMOID_PLUGIN_ID="org.kde.plasma.pingmonitor"
-TARGET_LIB_DIR="/usr/local/lib/ping-monitor"
-TARGET_PLASMOID_SOURCE="/usr/local/bin/ping-monitor-plasmoid-source"
+LEGACY_LIB_DIR="/usr/local/lib/ping-monitor"
+LEGACY_HELPER_BIN="/usr/local/bin/ping-monitor-plasmoid-source"
 
-if [[ $EUID -ne 0 ]]; then
-    exec pkexec bash "$SELF" "$@"
-fi
+needs_root_cleanup() {
+    [[ -e "$LEGACY_HELPER_BIN" || -d "$LEGACY_LIB_DIR" ]]
+}
 
-run_as_user() {
-    if [[ -n "${PKEXEC_UID:-}" ]]; then
-        sudo -u "#${PKEXEC_UID}" XDG_RUNTIME_DIR="/run/user/${PKEXEC_UID}" HOME="$HOME" "$@"
+# The plasmoid no longer uses a daemon — it spawns its own short-lived `ping`
+# forks from QML. Old installs left behind a systemd --user unit and a couple
+# of files under /usr/local. Tear them down idempotently before upgrading.
+teardown_legacy_user_daemon() {
+    if systemctl --user list-unit-files "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
     else
-        "$@"
+        # Even if list-unit-files doesn't show it, try stop in case it's
+        # transient/loaded but not enabled.
+        systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
+    if [[ -f "$USER_SYSTEMD_DIR/$SERVICE_NAME" ]]; then
+        rm -f -- "$USER_SYSTEMD_DIR/$SERVICE_NAME"
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+teardown_legacy_root_files() {
+    [[ -e "$LEGACY_HELPER_BIN" ]] && rm -f -- "$LEGACY_HELPER_BIN"
+    [[ -d "$LEGACY_LIB_DIR" ]] && rm -rf -- "$LEGACY_LIB_DIR"
+    return 0
 }
 
 upgrade_or_install_plasmoid() {
     local plasmoid_dir="$1"
     local plugin_id="$2"
     local canonical_dir
-    local show_output
-    local installed_path
-    local canonical_installed
+    local user_plasmoid_dir="$HOME/.local/share/plasma/plasmoids/$plugin_id"
     canonical_dir="$(realpath "$plasmoid_dir")"
-    show_output="$(run_as_user kpackagetool6 -t Plasma/Applet --show "$plugin_id" 2>/dev/null || true)"
-    installed_path="$(printf '%s\n' "$show_output" | sed -n 's/^[[:space:]]*Path[[:space:]]*:[[:space:]]*//p' | head -n1)"
-    if [[ -n "$installed_path" && -e "$installed_path" ]]; then
-        canonical_installed="$(realpath "$installed_path")"
-        if [[ "$canonical_installed" == "$canonical_dir" ]]; then
-            echo "Plasma widget already installed from source path: $canonical_dir"
-            return 0
+
+    # If a dev symlink at ~/.local/share/plasma/plasmoids/<id> points back at
+    # *this* checkout, remove the symlink itself before invoking kpackagetool6.
+    # Otherwise `kpackagetool6 --upgrade` follows the symlink and rm -rf's the
+    # source repo. We only touch links pointing at this checkout — an unrelated
+    # symlinked install (e.g. another working tree) is left alone and we bail
+    # out so the user can resolve it manually.
+    if [[ -L "$user_plasmoid_dir" ]]; then
+        local installed_target
+        installed_target="$(realpath "$user_plasmoid_dir")"
+        if [[ "$installed_target" == "$canonical_dir" ]]; then
+            echo "Removing dev symlink $user_plasmoid_dir -> $(readlink "$user_plasmoid_dir")"
+            rm -f -- "$user_plasmoid_dir"
+        else
+            echo "Refusing to remove unrelated symlink $user_plasmoid_dir -> $(readlink "$user_plasmoid_dir")" >&2
+            echo "Resolved target ($installed_target) does not match this checkout ($canonical_dir)." >&2
+            return 1
         fi
     fi
-    if [[ -n "$installed_path" ]]; then
-        run_as_user kpackagetool6 -t Plasma/Applet --upgrade "$canonical_dir"
+
+    if [[ -d "$user_plasmoid_dir" ]]; then
+        kpackagetool6 -t Plasma/Applet --upgrade "$canonical_dir"
     else
-        run_as_user kpackagetool6 -t Plasma/Applet --install "$canonical_dir"
+        kpackagetool6 -t Plasma/Applet --install "$canonical_dir"
     fi
 }
 
-if [[ -n "${PKEXEC_UID:-}" ]]; then
-    HOME="$(getent passwd "$PKEXEC_UID" | cut -d: -f6)"
-    export HOME
-    export XDG_DATA_HOME="${HOME}/.local/share"
-    USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
+# Phase 1: user-level teardown of the old daemon. Always safe to run as the
+# invoking user — no privileges required.
+teardown_legacy_user_daemon
+
+# Phase 2: root-owned legacy files under /usr/local. Only re-exec under pkexec
+# when something is actually there to remove, so a clean install never asks
+# for a polkit prompt.
+if needs_root_cleanup; then
+    if [[ $EUID -ne 0 ]]; then
+        echo "Removing legacy /usr/local helper files (requires elevation)..."
+        pkexec rm -rf -- "$LEGACY_HELPER_BIN" "$LEGACY_LIB_DIR"
+    else
+        teardown_legacy_root_files
+    fi
 fi
 
-install -d -m755 "$TARGET_LIB_DIR"
-install -Dm755 "$SCRIPT_DIR/ping-monitor-plasmoid-source.py" "$TARGET_LIB_DIR/ping-monitor-plasmoid-source.py"
-install -Dm755 /dev/stdin "$TARGET_PLASMOID_SOURCE" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-exec python3 "/usr/local/lib/ping-monitor/ping-monitor-plasmoid-source.py" "$@"
-EOF
-
-mkdir -p "$USER_SYSTEMD_DIR"
-sed "s|@@REPO_DIR@@|${SCRIPT_DIR}|g" \
-    "$SCRIPT_DIR/ping-monitor-daemon.service" \
-    > "$USER_SYSTEMD_DIR/$SERVICE_NAME"
-
-run_as_user systemctl --user daemon-reload
-run_as_user systemctl --user enable "$SERVICE_NAME"
-run_as_user systemctl --user restart "$SERVICE_NAME"
+# Phase 3: install/upgrade the plasmoid as the invoking user. If we somehow
+# got here as root (e.g. a manual `sudo bash install.sh`), bail — kpackagetool6
+# would write into root's home, not the user's.
+if [[ $EUID -eq 0 ]]; then
+    echo "Refusing to run kpackagetool6 as root; re-run install.sh as your user." >&2
+    exit 1
+fi
 
 upgrade_or_install_plasmoid "$SCRIPT_DIR" "$PLASMOID_PLUGIN_ID"
 
-echo "Installed ping-monitor daemon, plasmoid source helper, and refreshed applet registration."
+echo "Installed ping-monitor plasmoid (no daemon; the widget owns its ping forks)."

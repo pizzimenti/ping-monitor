@@ -1,17 +1,32 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Shapes
-import QtCore
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
+import org.kde.plasma.extras as PlasmaExtras
 import org.kde.plasma.plasma5support as Plasma5Support
 import org.kde.kirigami as Kirigami
 
 PlasmoidItem {
     id: root
 
-    // This plasmoid only has a full representation.
-    preferredRepresentation: fullRepresentation
+    // Panel widget: tray icon by default, popup chart on click. Mirrors the
+    // wifimimo / audiomux / dell-fans pattern in this widget family.
+    preferredRepresentation: compactRepresentation
+
+    // Two cadences, switched by root.expanded (the PlasmoidItem property,
+    // not the Plasmoid attached object — `expanded` is not on the attached
+    // namespace):
+    //   - fast (1 Hz) while the popup is open: drives the live chart.
+    //   - slow (every 5 s) while collapsed: keeps the tray icon's tier
+    //     (good/warn/alert/disabled) honest and slowly fills the in-memory
+    //     history ring buffer, so reopening the popup shows a populated
+    //     chart instead of a blank canvas. Matches wifimimo's daemon-side
+    //     slow cadence even though we have no daemon — the work is just
+    //     three ping forks every 5 s.
+    readonly property int fastPingMs: 1000
+    readonly property int slowPingMs: 5000
+    readonly property int currentPingInterval: root.expanded ? fastPingMs : slowPingMs
 
     // Latest parsed ping values (ms); -1 means timeout/unavailable.
     property real currentCloudflarePing: -1
@@ -28,11 +43,17 @@ PlasmoidItem {
     property real displayGatewayPing: -1
 
     property bool chartDirty: false
-    readonly property string currentCommand: "ping-monitor-plasmoid-source"
-    property int lastCloudflareSeq: -1
-    property int lastGoogleSeq: -1
-    property int lastGatewaySeq: -1
-    property int daemonTimestamp: 0
+
+    // Fixed ping targets. The plasmoid spawns a short-lived `ping -c 1 -W 1`
+    // for each of these once per second; no daemon, no state file. -W 1 caps
+    // each fork at ~1.2s so cleanup is automatic — even if disconnectSource
+    // failed to kill a child, nothing lingers.
+    readonly property string cloudflareHost: "1.1.1.1"
+    readonly property string googleHost: "8.8.8.8"
+    readonly property string cloudflareCommand: "ping -n -c 1 -W 1 " + cloudflareHost
+    readonly property string googleCommand: "ping -n -c 1 -W 1 " + googleHost
+    property string gatewayCommand: ""
+    readonly property string gatewayLookupCommand: "ip -4 route show default"
 
     property int windowSecs: 60
     readonly property var windowOptions: [
@@ -51,12 +72,87 @@ PlasmoidItem {
 
     property bool shuttingDown: false
     readonly property bool samplingActive: !shuttingDown
-            && visible
             && Plasmoid.status !== PlasmaCore.Types.HiddenStatus
 
     property string gatewayIp: ""
     property bool gatewayOnline: false
     property string lastPingReceivedText: "--:--:--"
+
+    // --- Icon-tier state machine ----------------------------------------
+    // alert    : both 1.1.1.1 and 8.8.8.8 timing out (internet unreachable).
+    // warn     : one of cloudflare/google timing out OR fastest latency > warnLatencyMs.
+    // good     : both responding, fastest latency ≤ warnLatencyMs.
+    // disabled : no data yet (just started, slow-poll hasn't returned).
+    // Threshold sized for "is something wrong": typical residential
+    // internet sits 5–40 ms, datacenter access 1–10 ms. 150 ms is well
+    // above normal but below pathologically broken, so it catches
+    // congestion/wifi issues without crying wolf on a transient spike.
+    readonly property int warnLatencyMs: 150
+
+    readonly property bool cloudflareUp: currentCloudflarePing >= 0
+    readonly property bool googleUp: currentGooglePing >= 0
+    readonly property real fastestInternetPing: {
+        if (cloudflareUp && googleUp) {
+            return Math.min(currentCloudflarePing, currentGooglePing)
+        }
+        if (cloudflareUp) {
+            return currentCloudflarePing
+        }
+        if (googleUp) {
+            return currentGooglePing
+        }
+        return -1
+    }
+    readonly property bool hasAnyData: cloudflareUp || googleUp || currentGatewayPing >= 0
+
+    readonly property string iconTier: {
+        if (!hasAnyData) {
+            return "disabled"
+        }
+        if (!cloudflareUp && !googleUp) {
+            return "alert"
+        }
+        if (!cloudflareUp || !googleUp || fastestInternetPing > warnLatencyMs) {
+            return "warn"
+        }
+        return "good"
+    }
+    readonly property color iconColor: {
+        if (iconTier === "alert") {
+            return Kirigami.Theme.negativeTextColor
+        }
+        if (iconTier === "warn") {
+            return Kirigami.Theme.neutralTextColor
+        }
+        if (iconTier === "good") {
+            return Kirigami.Theme.positiveTextColor
+        }
+        return Kirigami.Theme.textColor
+    }
+    readonly property real iconOpacity: iconTier === "disabled" ? 0.45 : 1.0
+
+    Plasmoid.icon: "kstars_satellites"
+    // Alert tier forces the icon out of the auto-hide tray section so an
+    // outage is actually visible. Other tiers stay Active so the icon is
+    // always present but doesn't push past the system-tray collapse.
+    Plasmoid.status: iconTier === "alert"
+            ? PlasmaCore.Types.NeedsAttentionStatus
+            : PlasmaCore.Types.ActiveStatus
+
+    toolTipMainText: "Ping Monitor"
+    toolTipSubText: {
+        if (!hasAnyData) {
+            return "Waiting for first sample…"
+        }
+        var lines = []
+        lines.push("1.1.1.1: " + (cloudflareUp ? currentCloudflarePing.toFixed(0) + " ms" : "timeout"))
+        lines.push("8.8.8.8: " + (googleUp ? currentGooglePing.toFixed(0) + " ms" : "timeout"))
+        if (gatewayIp.length > 0) {
+            lines.push(gatewayIp + ": " + (currentGatewayPing >= 0 ? currentGatewayPing.toFixed(0) + " ms" : "timeout"))
+        }
+        return lines.join("\n")
+    }
+    toolTipTextFormat: Text.PlainText
 
     function updateGatewayIp(newIp) {
         var ip = (newIp || "").trim()
@@ -138,75 +234,85 @@ PlasmoidItem {
         chartDirty = true
     }
 
-    function parseStateSnapshot(rawText) {
-        const next = {
-            timestamp: 0,
-            gateway_ip: "",
-            cloudflare_ping: -1,
-            cloudflare_seq: -1,
-            google_ping: -1,
-            google_seq: -1,
-            gateway_ping: -1,
-            gateway_seq: -1
-        };
-        for (const line of (rawText || "").split(/\r?\n/)) {
-            if (!line || !line.includes("=")) {
-                continue;
-            }
-            const idx = line.indexOf("=");
-            const key = line.slice(0, idx);
-            const value = line.slice(idx + 1);
-            if (key === "timestamp") {
-                next.timestamp = parseInt(value, 10) || 0;
-            } else if (key === "gateway_ip") {
-                next.gateway_ip = value;
-            } else if (key === "cloudflare_ping") {
-                next.cloudflare_ping = parseFloat(value);
-            } else if (key === "cloudflare_seq") {
-                next.cloudflare_seq = parseInt(value, 10) || 0;
-            } else if (key === "google_ping") {
-                next.google_ping = parseFloat(value);
-            } else if (key === "google_seq") {
-                next.google_seq = parseInt(value, 10) || 0;
-            } else if (key === "gateway_ping") {
-                next.gateway_ping = parseFloat(value);
-            } else if (key === "gateway_seq") {
-                next.gateway_seq = parseInt(value, 10) || 0;
-            }
+    // Parse the first "time=X ms" (or "time<X ms") field from a `ping -c 1`
+    // stdout chunk. Returns -1 for timeout/unreachable/parse failure.
+    function parsePingMs(rawText) {
+        const text = rawText || "";
+        const lower = text.toLowerCase();
+        if (lower.indexOf("100% packet loss") !== -1
+                || lower.indexOf("unreachable") !== -1
+                || lower.indexOf("no answer yet") !== -1) {
+            return -1;
         }
-
-        daemonTimestamp = next.timestamp;
-        updateGatewayIp(next.gateway_ip);
-
-        if (next.cloudflare_seq > lastCloudflareSeq) {
-            lastCloudflareSeq = next.cloudflare_seq;
-            applyPing("cloudflare", isNaN(next.cloudflare_ping) ? -1 : next.cloudflare_ping);
+        const match = text.match(/time[=<]([\d.]+)\s*ms/i);
+        if (!match) {
+            return -1;
         }
-        if (next.google_seq > lastGoogleSeq) {
-            lastGoogleSeq = next.google_seq;
-            applyPing("google", isNaN(next.google_ping) ? -1 : next.google_ping);
+        const value = parseFloat(match[1]);
+        if (isNaN(value) || value < 0) {
+            return -1;
         }
-        if (next.gateway_seq > lastGatewaySeq) {
-            lastGatewaySeq = next.gateway_seq;
-            applyPing("gateway", isNaN(next.gateway_ping) ? -1 : next.gateway_ping);
-        }
+        return value;
     }
 
-    function readStateFile() {
+    // Pull the gateway IP out of `ip -4 route show default` output.
+    function parseGatewayIp(rawText) {
+        const lines = (rawText || "").split(/\r?\n/);
+        for (const line of lines) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 3 && parts[0] === "default" && parts[1] === "via") {
+                return parts[2];
+            }
+        }
+        return "";
+    }
+
+    function spawnPing(command) {
+        if (!command) {
+            return;
+        }
+        // Re-connecting an already-connected source is a no-op for the engine
+        // but the disconnect-then-connect dance forces a fresh run. -W 1 caps
+        // the in-flight ping at ~1.2s so even back-to-back ticks won't pile up.
+        executableSource.disconnectSource(command);
+        executableSource.connectSource(command);
+    }
+
+    function pingAllTargets() {
         if (!samplingActive) {
             return;
         }
-        executableSource.disconnectSource(currentCommand);
-        executableSource.connectSource(currentCommand);
+        spawnPing(cloudflareCommand);
+        spawnPing(googleCommand);
+        if (gatewayCommand.length > 0) {
+            spawnPing(gatewayCommand);
+        }
+    }
+
+    function refreshGateway() {
+        if (!samplingActive) {
+            return;
+        }
+        executableSource.disconnectSource(gatewayLookupCommand);
+        executableSource.connectSource(gatewayLookupCommand);
     }
 
     Timer {
-        id: statePollTimer
-        interval: 1000
+        id: pingTimer
+        interval: root.currentPingInterval
         running: root.samplingActive
         repeat: true
         triggeredOnStart: true
-        onTriggered: root.readStateFile()
+        onTriggered: root.pingAllTargets()
+    }
+
+    Timer {
+        id: gatewayRefreshTimer
+        interval: 30000
+        running: root.samplingActive
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.refreshGateway()
     }
 
     Plasma5Support.DataSource {
@@ -214,19 +320,80 @@ PlasmoidItem {
         engine: "executable"
         interval: 0
         onNewData: (sourceName, sourceData) => {
-            if (sourceName !== root.currentCommand) {
-                return;
+            const stdout = sourceData["stdout"] || "";
+            if (sourceName === root.cloudflareCommand) {
+                root.applyPing("cloudflare", root.parsePingMs(stdout));
+            } else if (sourceName === root.googleCommand) {
+                root.applyPing("google", root.parsePingMs(stdout));
+            } else if (sourceName === root.gatewayLookupCommand) {
+                const ip = root.parseGatewayIp(stdout);
+                root.updateGatewayIp(ip);
+                root.gatewayCommand = ip.length > 0
+                        ? "ping -n -c 1 -W 1 " + ip
+                        : "";
+            } else if (sourceName === root.gatewayCommand && root.gatewayCommand.length > 0) {
+                root.applyPing("gateway", root.parsePingMs(stdout));
             }
-            root.parseStateSnapshot(sourceData.stdout || "");
             executableSource.disconnectSource(sourceName);
         }
     }
 
-    fullRepresentation: Item {
-        Layout.preferredWidth: Kirigami.Units.gridUnit * 18
-        Layout.preferredHeight: Kirigami.Units.gridUnit * 10
-        Layout.minimumWidth: Kirigami.Units.gridUnit * 12
-        Layout.minimumHeight: Kirigami.Units.gridUnit * 6
+    Component.onCompleted: {
+        // Kick the first poll cycle immediately so the icon colour
+        // converges within ~1 s of the widget being added, instead of
+        // waiting up to slowPingMs (10 s) for the first scheduled tick.
+        refreshGateway()
+        pingAllTargets()
+    }
+
+    onExpandedChanged: function() {
+        // When the popup opens, fire a fresh 1 s-cadence ping right away
+        // so the chart starts updating without waiting for the timer's
+        // next tick (which could be up to 10 s away if we were collapsed).
+        if (root.expanded) {
+            pingAllTargets()
+        }
+    }
+
+    // Tray icon — colored satellite (from kstars's icon set) that flips
+    // between the four iconTier colors. Click toggles the popup chart.
+    // The Layout.fill* / Layout.min* dance is panel-orientation-aware so
+    // we behave correctly in both horizontal (RowLayout) and vertical
+    // (ColumnLayout) panel containments:
+    //   - Horizontal panel: fill height (panel's fixed dimension), let
+    //     width fall out as a square matched to height.
+    //   - Vertical panel: fill width (panel's fixed dimension), let
+    //     height fall out as a square matched to width.
+    // Without this guard, Layout.fillHeight in a vertical panel would
+    // claim the whole panel column. Mirrors the systemmonitor stock
+    // applet's CompactRepresentation layout idiom.
+    compactRepresentation: MouseArea {
+        readonly property bool verticalPanel: Plasmoid.formFactor === PlasmaCore.Types.Vertical
+        acceptedButtons: Qt.LeftButton
+        Layout.fillWidth: verticalPanel
+        Layout.fillHeight: !verticalPanel
+        Layout.minimumWidth: verticalPanel ? Kirigami.Units.iconSizes.small : height
+        Layout.minimumHeight: verticalPanel ? width : Kirigami.Units.iconSizes.small
+        Layout.preferredWidth: verticalPanel ? Kirigami.Units.iconSizes.smallMedium : height
+        Layout.preferredHeight: verticalPanel ? width : Kirigami.Units.iconSizes.smallMedium
+        onClicked: root.expanded = !root.expanded
+
+        Kirigami.Icon {
+            anchors.fill: parent
+            source: "kstars_satellites"
+            isMask: true
+            color: root.iconColor
+            opacity: root.iconOpacity
+            active: root.expanded
+        }
+    }
+
+    fullRepresentation: PlasmaExtras.Representation {
+        Layout.minimumWidth: Kirigami.Units.gridUnit * 30
+        Layout.minimumHeight: Kirigami.Units.gridUnit * 14
+        Layout.preferredWidth: Kirigami.Units.gridUnit * 36
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 16
+        collapseMarginsHint: true
 
         Rectangle {
             anchors.fill: parent
@@ -877,38 +1044,32 @@ PlasmoidItem {
                         onTriggered: chartView.refreshVisibleFromHistory()
                     }
 
+                    // History keeps filling at the pingTimer cadence (1 s
+                    // expanded / 5 s collapsed) so the chart re-opens with
+                    // recent data already buffered. Path rebuilds and the
+                    // axis easing only happen while the popup is expanded —
+                    // there's no point spending CPU painting an invisible
+                    // chart.
                     Timer {
                         id: chartUpdateTimer
-                        interval: 1000
+                        interval: root.currentPingInterval
                         repeat: true
-                        running: chartView.visible && root.samplingActive
+                        running: root.samplingActive
                         onTriggered: {
                             var now = Date.now()
+                            chartView.pushHistorySample(now)
+
+                            if (!root.expanded || !chartView.visible) {
+                                return
+                            }
+
                             var oldAxisTop = root.axisTopMs()
 
-                            var maxDelta = root.maxPing - root.displayMaxPing
-                            if (Math.abs(maxDelta) > 0.25) {
-                                root.displayMaxPing += maxDelta * 0.2
-                            } else {
-                                root.displayMaxPing = root.maxPing
-                            }
-                            var rebuilt = false
-                            if (chartView.ensureBuffers()) {
-                                chartView.fillVisibleFromHistory(now)
-                                chartView.scrollAccPoints = 0
-                                rebuilt = true
-                            }
-                            chartView.pushHistorySample(now)
-                            var pointsPerTick = (chartView.pointCount > 0) ? (chartView.pointCount / root.windowSecs) : 0
-                            chartView.scrollAccPoints += pointsPerTick
-                            var ds = Math.floor(chartView.scrollAccPoints)
-                            if (ds > 0) {
-                                chartView.scrollAccPoints -= ds
-                                rebuilt = chartView.appendVisibleSamples(ds, now) || rebuilt
-                            }
-
-                            var axisChanged = Math.abs(root.axisTopMs() - oldAxisTop) > 0.1
-
+                            // Compute this tick's desired ceiling from the
+                            // current visible window (plus any in-flight
+                            // sample that hasn't propagated into cachedMax
+                            // yet, for sub-10-min windows where transients
+                            // matter).
                             var visibleMax = chartView.cachedMax
                             if (root.windowSecs < 600) {
                                 if (root.displayCloudflarePing > visibleMax) {
@@ -924,11 +1085,60 @@ PlasmoidItem {
                             if (visibleMax < 0) {
                                 visibleMax = 100
                             }
-                            root.maxPing = Math.max(100, Math.ceil(visibleMax / 25) * 25)
+                            var newMaxPing = Math.max(100, Math.ceil(visibleMax / 25) * 25)
+                            root.maxPing = newMaxPing
+
+                            // Directional easing for the rendered axis
+                            // ceiling. Snap up immediately on expansion so
+                            // a sudden RTT spike isn't clipped at the
+                            // previous tick's lower ceiling; ease down at
+                            // 5 %/tick on contraction so the chart doesn't
+                            // jitter the axis after every transient peak
+                            // ages out of the visible window.
+                            if (newMaxPing >= root.displayMaxPing) {
+                                root.displayMaxPing = newMaxPing
+                            } else {
+                                var maxDelta = newMaxPing - root.displayMaxPing
+                                if (Math.abs(maxDelta) > 0.25) {
+                                    root.displayMaxPing += maxDelta * 0.05
+                                } else {
+                                    root.displayMaxPing = newMaxPing
+                                }
+                            }
+
+                            var rebuilt = false
+                            if (chartView.ensureBuffers()) {
+                                chartView.fillVisibleFromHistory(now)
+                                chartView.scrollAccPoints = 0
+                                rebuilt = true
+                            }
+                            var pointsPerTick = (chartView.pointCount > 0) ? (chartView.pointCount / root.windowSecs) : 0
+                            chartView.scrollAccPoints += pointsPerTick
+                            var ds = Math.floor(chartView.scrollAccPoints)
+                            if (ds > 0) {
+                                chartView.scrollAccPoints -= ds
+                                rebuilt = chartView.appendVisibleSamples(ds, now) || rebuilt
+                            }
+
+                            var axisChanged = Math.abs(root.axisTopMs() - oldAxisTop) > 0.1
+
                             if (root.chartDirty || rebuilt || axisChanged) {
                                 chartView.rebuildPathsAndExtrema()
                                 chartView.updateLiveLabels()
                                 root.chartDirty = false
+                            }
+                        }
+                    }
+
+                    // Catch-up render when the popup is reopened after a
+                    // collapsed stretch — `chartUpdateTimer` was skipping
+                    // path rebuilds, so the chart visuals are stale relative
+                    // to what's now in the history ring buffer.
+                    Connections {
+                        target: root
+                        function onExpandedChanged() {
+                            if (root.expanded) {
+                                chartView.refreshVisibleFromHistory()
                             }
                         }
                     }
@@ -1166,6 +1376,19 @@ PlasmoidItem {
 
     Component.onDestruction: {
         shuttingDown = true
-        try { if (statePollTimer) statePollTimer.stop() } catch (e) {}
+        try { if (pingTimer) pingTimer.stop() } catch (e) {}
+        try { if (gatewayRefreshTimer) gatewayRefreshTimer.stop() } catch (e) {}
+        // Best-effort cleanup of any in-flight ping forks. With -W 1 each ping
+        // self-terminates inside ~1.2s anyway, so this is belt-and-suspenders.
+        try {
+            if (executableSource) {
+                executableSource.disconnectSource(cloudflareCommand)
+                executableSource.disconnectSource(googleCommand)
+                executableSource.disconnectSource(gatewayLookupCommand)
+                if (gatewayCommand.length > 0) {
+                    executableSource.disconnectSource(gatewayCommand)
+                }
+            }
+        } catch (e) {}
     }
 }
