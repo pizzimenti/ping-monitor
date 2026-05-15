@@ -18,12 +18,14 @@ PlasmoidItem {
     // not the Plasmoid attached object — `expanded` is not on the attached
     // namespace):
     //   - fast (1 Hz) while the popup is open: drives the live chart.
-    //   - slow (every 10 s) while collapsed: just enough to keep the tray
-    //     icon's tier (good/warn/alert/disabled) honest. History pushes
-    //     happen at the slow rate too, so the chart re-opens with the last
-    //     hour of background samples already in it.
+    //   - slow (every 5 s) while collapsed: keeps the tray icon's tier
+    //     (good/warn/alert/disabled) honest and slowly fills the in-memory
+    //     history ring buffer, so reopening the popup shows a populated
+    //     chart instead of a blank canvas. Matches wifimimo's daemon-side
+    //     slow cadence even though we have no daemon — the work is just
+    //     three ping forks every 5 s.
     readonly property int fastPingMs: 1000
-    readonly property int slowPingMs: 10000
+    readonly property int slowPingMs: 5000
     readonly property int currentPingInterval: root.expanded ? fastPingMs : slowPingMs
 
     // Latest parsed ping values (ms); -1 means timeout/unavailable.
@@ -129,7 +131,7 @@ PlasmoidItem {
     }
     readonly property real iconOpacity: iconTier === "disabled" ? 0.45 : 1.0
 
-    Plasmoid.icon: "chronometer"
+    Plasmoid.icon: "kstars_satellites"
     // Alert tier forces the icon out of the auto-hide tray section so an
     // outage is actually visible. Other tiers stay Active so the icon is
     // always present but doesn't push past the system-tray collapse.
@@ -353,8 +355,8 @@ PlasmoidItem {
         }
     }
 
-    // Tray icon — colored chronometer that flips between the four iconTier
-    // colors. Click toggles the popup chart.
+    // Tray icon — colored satellite (from kstars's icon set) that flips
+    // between the four iconTier colors. Click toggles the popup chart.
     compactRepresentation: MouseArea {
         acceptedButtons: Qt.LeftButton
         implicitWidth: Kirigami.Units.iconSizes.smallMedium
@@ -364,7 +366,7 @@ PlasmoidItem {
         Kirigami.Icon {
             anchors.fill: parent
             anchors.margins: 1
-            source: "chronometer"
+            source: "kstars_satellites"
             isMask: true
             color: root.iconColor
             opacity: root.iconOpacity
