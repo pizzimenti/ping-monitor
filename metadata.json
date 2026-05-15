@@ -5,6 +5,9 @@
         "Description": "Displays ping latency to Cloudflare (1.1.1.1) and Google DNS (8.8.8.8) on a rolling 90s line graph\n",
         "Version": "1.0.2",
         "Category": "Network",
+        "FormFactors": [
+            "desktop"
+        ],
         "Icon": "network-wired",
         "Authors": [
             {
