@@ -357,16 +357,25 @@ PlasmoidItem {
 
     // Tray icon — colored satellite (from kstars's icon set) that flips
     // between the four iconTier colors. Click toggles the popup chart.
-    // Layout.fillHeight makes the icon scale up to the panel's available
-    // height instead of staying pinned at a small 22 px hint; the
-    // kstars_satellites SVG has enough whitespace inside its 22×22
-    // viewBox that smallMedium felt visibly underweight next to the
-    // sibling applets in the tray.
+    // The Layout.fill* / Layout.min* dance is panel-orientation-aware so
+    // we behave correctly in both horizontal (RowLayout) and vertical
+    // (ColumnLayout) panel containments:
+    //   - Horizontal panel: fill height (panel's fixed dimension), let
+    //     width fall out as a square matched to height.
+    //   - Vertical panel: fill width (panel's fixed dimension), let
+    //     height fall out as a square matched to width.
+    // Without this guard, Layout.fillHeight in a vertical panel would
+    // claim the whole panel column. Mirrors the systemmonitor stock
+    // applet's CompactRepresentation layout idiom.
     compactRepresentation: MouseArea {
+        readonly property bool verticalPanel: Plasmoid.formFactor === PlasmaCore.Types.Vertical
         acceptedButtons: Qt.LeftButton
-        Layout.fillHeight: true
-        Layout.minimumWidth: height
-        Layout.preferredWidth: height
+        Layout.fillWidth: verticalPanel
+        Layout.fillHeight: !verticalPanel
+        Layout.minimumWidth: verticalPanel ? Kirigami.Units.iconSizes.small : height
+        Layout.minimumHeight: verticalPanel ? width : Kirigami.Units.iconSizes.small
+        Layout.preferredWidth: verticalPanel ? Kirigami.Units.iconSizes.smallMedium : height
+        Layout.preferredHeight: verticalPanel ? width : Kirigami.Units.iconSizes.smallMedium
         onClicked: root.expanded = !root.expanded
 
         Kirigami.Icon {
@@ -1036,7 +1045,7 @@ PlasmoidItem {
                     }
 
                     // History keeps filling at the pingTimer cadence (1 s
-                    // expanded / 10 s collapsed) so the chart re-opens with
+                    // expanded / 5 s collapsed) so the chart re-opens with
                     // recent data already buffered. Path rebuilds and the
                     // axis easing only happen while the popup is expanded —
                     // there's no point spending CPU painting an invisible
@@ -1056,12 +1065,47 @@ PlasmoidItem {
 
                             var oldAxisTop = root.axisTopMs()
 
-                            var maxDelta = root.maxPing - root.displayMaxPing
-                            if (Math.abs(maxDelta) > 0.25) {
-                                root.displayMaxPing += maxDelta * 0.2
-                            } else {
-                                root.displayMaxPing = root.maxPing
+                            // Compute this tick's desired ceiling from the
+                            // current visible window (plus any in-flight
+                            // sample that hasn't propagated into cachedMax
+                            // yet, for sub-10-min windows where transients
+                            // matter).
+                            var visibleMax = chartView.cachedMax
+                            if (root.windowSecs < 600) {
+                                if (root.displayCloudflarePing > visibleMax) {
+                                    visibleMax = root.displayCloudflarePing
+                                }
+                                if (root.displayGooglePing > visibleMax) {
+                                    visibleMax = root.displayGooglePing
+                                }
+                                if (root.displayGatewayPing > visibleMax) {
+                                    visibleMax = root.displayGatewayPing
+                                }
                             }
+                            if (visibleMax < 0) {
+                                visibleMax = 100
+                            }
+                            var newMaxPing = Math.max(100, Math.ceil(visibleMax / 25) * 25)
+                            root.maxPing = newMaxPing
+
+                            // Directional easing for the rendered axis
+                            // ceiling. Snap up immediately on expansion so
+                            // a sudden RTT spike isn't clipped at the
+                            // previous tick's lower ceiling; ease down at
+                            // 5 %/tick on contraction so the chart doesn't
+                            // jitter the axis after every transient peak
+                            // ages out of the visible window.
+                            if (newMaxPing >= root.displayMaxPing) {
+                                root.displayMaxPing = newMaxPing
+                            } else {
+                                var maxDelta = newMaxPing - root.displayMaxPing
+                                if (Math.abs(maxDelta) > 0.25) {
+                                    root.displayMaxPing += maxDelta * 0.05
+                                } else {
+                                    root.displayMaxPing = newMaxPing
+                                }
+                            }
+
                             var rebuilt = false
                             if (chartView.ensureBuffers()) {
                                 chartView.fillVisibleFromHistory(now)
@@ -1078,22 +1122,6 @@ PlasmoidItem {
 
                             var axisChanged = Math.abs(root.axisTopMs() - oldAxisTop) > 0.1
 
-                            var visibleMax = chartView.cachedMax
-                            if (root.windowSecs < 600) {
-                                if (root.displayCloudflarePing > visibleMax) {
-                                    visibleMax = root.displayCloudflarePing
-                                }
-                                if (root.displayGooglePing > visibleMax) {
-                                    visibleMax = root.displayGooglePing
-                                }
-                                if (root.displayGatewayPing > visibleMax) {
-                                    visibleMax = root.displayGatewayPing
-                                }
-                            }
-                            if (visibleMax < 0) {
-                                visibleMax = 100
-                            }
-                            root.maxPing = Math.max(100, Math.ceil(visibleMax / 25) * 25)
                             if (root.chartDirty || rebuilt || axisChanged) {
                                 chartView.rebuildPathsAndExtrema()
                                 chartView.updateLiveLabels()

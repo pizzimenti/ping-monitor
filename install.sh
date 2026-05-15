@@ -2,7 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SELF="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 SERVICE_NAME="ping-monitor-daemon.service"
 PLASMOID_PLUGIN_ID="org.kde.plasma.pingmonitor"
