@@ -14,7 +14,9 @@ PlasmoidItem {
     // wifimimo / audiomux / dell-fans pattern in this widget family.
     preferredRepresentation: compactRepresentation
 
-    // Two cadences, switched by Plasmoid.expanded:
+    // Two cadences, switched by root.expanded (the PlasmoidItem property,
+    // not the Plasmoid attached object — `expanded` is not on the attached
+    // namespace):
     //   - fast (1 Hz) while the popup is open: drives the live chart.
     //   - slow (every 10 s) while collapsed: just enough to keep the tray
     //     icon's tier (good/warn/alert/disabled) honest. History pushes
@@ -22,7 +24,7 @@ PlasmoidItem {
     //     hour of background samples already in it.
     readonly property int fastPingMs: 1000
     readonly property int slowPingMs: 10000
-    readonly property int currentPingInterval: Plasmoid.expanded ? fastPingMs : slowPingMs
+    readonly property int currentPingInterval: root.expanded ? fastPingMs : slowPingMs
 
     // Latest parsed ping values (ms); -1 means timeout/unavailable.
     property real currentCloudflarePing: -1
@@ -331,6 +333,23 @@ PlasmoidItem {
                 root.applyPing("gateway", root.parsePingMs(stdout));
             }
             executableSource.disconnectSource(sourceName);
+        }
+    }
+
+    Component.onCompleted: {
+        // Kick the first poll cycle immediately so the icon colour
+        // converges within ~1 s of the widget being added, instead of
+        // waiting up to slowPingMs (10 s) for the first scheduled tick.
+        refreshGateway()
+        pingAllTargets()
+    }
+
+    onExpandedChanged: function() {
+        // When the popup opens, fire a fresh 1 s-cadence ping right away
+        // so the chart starts updating without waiting for the timer's
+        // next tick (which could be up to 10 s away if we were collapsed).
+        if (root.expanded) {
+            pingAllTargets()
         }
     }
 
