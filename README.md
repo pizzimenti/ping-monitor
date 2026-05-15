@@ -39,10 +39,14 @@ glance; click it for a popup with the rolling-window latency chart.
 
 ## Installation
 
-### Method 1: Install local `.plasmoid` package
+### Method 1: Install the published `.plasmoid` package
+
+Grab the latest `org.kde.plasma.pingmonitor-<version>.plasmoid` from
+the [Releases page](https://github.com/pizzimenti/ping-monitor/releases)
+and install it:
 
 ```bash
-kpackagetool6 --type Plasma/Applet --install /path/to/org.kde.plasma.pingmonitor-1.0.2.plasmoid
+kpackagetool6 --type Plasma/Applet --install ~/Downloads/org.kde.plasma.pingmonitor-<version>.plasmoid
 ```
 
 Use `--upgrade` instead of `--install` to update an existing install.

@@ -1,2 +1,3 @@
-__pycache__/
-*.pyc
+# Build artifacts — published to GitHub Releases, never tracked in git.
+*.plasmoid
+
