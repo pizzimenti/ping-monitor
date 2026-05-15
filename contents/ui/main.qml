@@ -9,8 +9,14 @@ import org.kde.kirigami as Kirigami
 PlasmoidItem {
     id: root
 
-    // This plasmoid only has a full representation.
-    preferredRepresentation: fullRepresentation
+    // metadata.json restricts FormFactors to ["desktop"] so the Add Widgets
+    // dialog hides this from panel contexts, but enforcement varies by Plasma
+    // version. Treat any non-Planar form factor (horizontal/vertical panel,
+    // mediacenter, application) as "wrong place" and fall back to a compact
+    // "remove me" representation that does no sampling.
+    readonly property bool isDesktopForm: Plasmoid.formFactor === PlasmaCore.Types.Planar
+
+    preferredRepresentation: isDesktopForm ? fullRepresentation : compactRepresentation
 
     // Latest parsed ping values (ms); -1 means timeout/unavailable.
     property real currentCloudflarePing: -1
@@ -57,6 +63,7 @@ PlasmoidItem {
     property bool shuttingDown: false
     readonly property bool samplingActive: !shuttingDown
             && visible
+            && isDesktopForm
             && Plasmoid.status !== PlasmaCore.Types.HiddenStatus
 
     property string gatewayIp: ""
@@ -244,6 +251,25 @@ PlasmoidItem {
                 root.applyPing("gateway", root.parsePingMs(stdout));
             }
             executableSource.disconnectSource(sourceName);
+        }
+    }
+
+    // Shown when the widget is placed somewhere other than the desktop
+    // (horizontal/vertical panel, mediacenter, application). Kept tiny so it
+    // doesn't crowd the panel; the icon-only tooltip explains the situation
+    // and the user can right-click → Remove.
+    compactRepresentation: Item {
+        Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
+        Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
+        Layout.minimumWidth: Kirigami.Units.iconSizes.small
+        Layout.minimumHeight: Kirigami.Units.iconSizes.small
+
+        Plasmoid.toolTipMainText: "Ping Monitor"
+        Plasmoid.toolTipSubText: "This widget is desktop-only. Right-click to remove it from the panel and add it to the desktop instead."
+
+        Kirigami.Icon {
+            anchors.fill: parent
+            source: "dialog-warning"
         }
     }
 
