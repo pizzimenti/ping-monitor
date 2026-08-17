@@ -598,7 +598,7 @@ PlasmoidItem {
         // again rather than publishing an answer to a stale question. Both
         // halves matter: the exit node can flip, and the ordinary route can
         // change under it without the exit node moving at all.
-        if ((exitNodeStatusOk && exitNodeOn) !== egressRequestViaExitNode
+        if (exitNodeOn !== egressRequestViaExitNode
                 || routeFingerprint !== egressRequestFingerprint) {
             invalidateEgress();
             return;
@@ -625,7 +625,14 @@ PlasmoidItem {
         if (!samplingActive) {
             return;
         }
-        egressRequestViaExitNode = exitNodeStatusOk && exitNodeOn;
+        // Deliberately not gated on exitNodeStatusOk. A transient `tailscale
+        // status` failure leaves exitNodeOn holding its last known value,
+        // which is still the best available description of how curl will
+        // actually leave; folding in the validity flag would instead classify
+        // the request as direct while it demonstrably traverses the exit node.
+        // That error would also be sticky — exitNodeOn never changed, so
+        // onExitNodeOnChanged would never fire to correct it.
+        egressRequestViaExitNode = exitNodeOn;
         egressRequestFingerprint = routeFingerprint;
         executableSource.disconnectSource(egressCommand);
         executableSource.connectSource(egressCommand);
