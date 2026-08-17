@@ -3,7 +3,7 @@
         "Id": "org.kde.plasma.pingmonitor",
         "Name": "Ping Monitor",
         "Description": "Panel widget that pings Cloudflare (1.1.1.1), Google DNS (8.8.8.8), and the default gateway. Colored tray icon for at-a-glance status; click for a rolling latency chart.\n",
-        "Version": "2.1.0",
+        "Version": "2.2.0",
         "Category": "Network",
         "FormFactors": [
             "horizontal",
