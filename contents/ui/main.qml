@@ -153,7 +153,11 @@ PlasmoidItem {
     // schedule leaks our address more often than it needs to. Refresh is
     // driven by those two events plus popup expand — i.e. when someone is
     // actually looking.
-    readonly property string egressCommand: "curl -s --max-time 5 https://ipinfo.io/json"
+    // -4 pins the lookup to the family the widget actually monitors. On a
+    // dual-stack host an unrestricted curl may answer over IPv6 and report an
+    // IPv6 address, while route invalidation watches the IPv4 path — the label
+    // would then describe an egress the rest of the widget knows nothing about.
+    readonly property string egressCommand: "curl -4 -s --max-time 5 https://ipinfo.io/json"
     property string egressIp: ""
     property string egressOrg: ""
     property bool egressOk: false
@@ -169,6 +173,10 @@ PlasmoidItem {
     // then — which, if the exit node flipped mid-request, is not the routing
     // that produced the address.
     property bool egressRequestViaExitNode: false
+    // Same idea for the ordinary route: an in-flight lookup spans a network
+    // change that leaves the exit node untouched (roaming, DHCP renewal) just
+    // as easily as one that flips it.
+    property string egressRequestFingerprint: ""
     // Current values may no longer describe the current network. Set when the
     // default route or the exit node changes, cleared once a fresh lookup
     // lands. Drives both the dimmed presentation and the expand-time refetch.
@@ -587,8 +595,11 @@ PlasmoidItem {
         }
         // Routing moved while this request was in flight, so the address it
         // returned describes a path we are no longer on. Discard it and go
-        // again rather than publishing an answer to a stale question.
-        if ((exitNodeStatusOk && exitNodeOn) !== egressRequestViaExitNode) {
+        // again rather than publishing an answer to a stale question. Both
+        // halves matter: the exit node can flip, and the ordinary route can
+        // change under it without the exit node moving at all.
+        if ((exitNodeStatusOk && exitNodeOn) !== egressRequestViaExitNode
+                || routeFingerprint !== egressRequestFingerprint) {
             invalidateEgress();
             return;
         }
@@ -615,6 +626,7 @@ PlasmoidItem {
             return;
         }
         egressRequestViaExitNode = exitNodeStatusOk && exitNodeOn;
+        egressRequestFingerprint = routeFingerprint;
         executableSource.disconnectSource(egressCommand);
         executableSource.connectSource(egressCommand);
     }
@@ -691,6 +703,15 @@ PlasmoidItem {
         onTriggered: {
             root.refreshGateway()
             root.refreshExitNode()
+            // Retry a failed identity lookup, but only while someone is
+            // looking. A timeout or a captive-portal interception otherwise
+            // leaves the label absent for as long as the popup stays open,
+            // since nothing else re-triggers until the route changes. Bounded
+            // by the popup's lifetime and this timer's 30 s period, so a
+            // persistently failing lookup can't hammer the third party.
+            if (root.expanded && !root.egressOk) {
+                root.refreshEgress()
+            }
         }
     }
 
