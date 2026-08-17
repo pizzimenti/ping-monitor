@@ -54,7 +54,10 @@ PlasmoidItem {
     readonly property string cloudflareCommand: "ping -n -c 1 -W 1 " + cloudflareHost
     readonly property string googleCommand: "ping -n -c 1 -W 1 " + googleHost
     property string gatewayCommand: ""
-    readonly property string gatewayLookupCommand: "ip -4 route show default"
+    // Two probes in one fork. `show default` gives the gateway to ping;
+    // `route get` resolves how a packet to the internet would *actually*
+    // leave, which is a different question once policy routing is involved.
+    readonly property string gatewayLookupCommand: "ip -4 route show default; ip route get " + cloudflareHost
 
     // --- Tailscale exit node ---------------------------------------------
     // Toggling routes all egress through a peer on the tailnet. Useful on
@@ -85,8 +88,13 @@ PlasmoidItem {
     property bool exitNodePeerFound: false
     property bool exitNodeApproved: false
     property bool exitNodePeerOnline: false
-    // Exit node engaged (per tailscaled, not per our own last click).
+    // Our configured host is the selected exit node. Drives the button.
     property bool exitNodeOn: false
+    // Some exit node is selected — not necessarily ours. Drives the egress
+    // classification, because traffic is tunnelled whichever peer was chosen,
+    // and a node picked from the CLI or another device would otherwise be
+    // rendered as direct egress.
+    property bool exitNodeAnyActive: false
     // A set command is in flight; suppresses double-fires and re-polls.
     property bool exitNodeBusy: false
     property string exitNodeIp: ""
@@ -140,6 +148,65 @@ PlasmoidItem {
                 ? "Routing via " + exitNodeHost
                 : "Direct egress"
     }
+
+    // --- Egress identity --------------------------------------------------
+    // Who the internet thinks we are. Only meaningful to look up from the
+    // outside, so this is the one thing the widget can't answer locally.
+    //
+    // Deliberately not on a timer: the answer only changes when the exit node
+    // flips or the underlying network does, and polling a third party on a
+    // schedule leaks our address more often than it needs to. Refresh is
+    // driven by those two events plus popup expand — i.e. when someone is
+    // actually looking.
+    // -4 pins the lookup to the family the widget actually monitors. On a
+    // dual-stack host an unrestricted curl may answer over IPv6 and report an
+    // IPv6 address, while route invalidation watches the IPv4 path — the label
+    // would then describe an egress the rest of the widget knows nothing about.
+    readonly property string egressCommand: "curl -4 -s --max-time 5 https://ipinfo.io/json"
+    property string egressIp: ""
+    property string egressOrg: ""
+    property bool egressOk: false
+    // Whether the exit node was engaged at the moment these values were read.
+    // The label's colour derives from this rather than the live exitNodeOn, so
+    // colour and text always describe the same observation — binding colour to
+    // live state made it flip seconds before the text caught up, briefly
+    // showing "tunnelled" styling over the previous network's address.
+    property bool egressViaExitNode: false
+    // Routing as it stood when the in-flight request was dispatched. The
+    // lookup has a five-second window, and reading the snapshot when the
+    // response lands would attribute the result to whatever routing exists by
+    // then — which, if the exit node flipped mid-request, is not the routing
+    // that produced the address.
+    property bool egressRequestViaExitNode: false
+    // Same idea for the ordinary route: an in-flight lookup spans a network
+    // change that leaves the exit node untouched (roaming, DHCP renewal) just
+    // as easily as one that flips it.
+    property string egressRequestFingerprint: ""
+    // Current values may no longer describe the current network. Set when the
+    // default route or the exit node changes, cleared once a fresh lookup
+    // lands. Drives both the dimmed presentation and the expand-time refetch.
+    property bool egressStale: false
+
+    // Identity of the default route, not just its gateway address. Roaming
+    // between two networks that both use 192.168.1.1 leaves the gateway
+    // unchanged, so keying off it alone would never notice the move and the
+    // widget would keep asserting the previous network's ISP. Interface and
+    // local source address disambiguate.
+    property string routeFingerprint: ""
+
+    // Backstop for network changes the fingerprint structurally cannot see:
+    // two networks can genuinely present the same interface, gateway, and
+    // lease, since consumer routers ship identical defaults and hand out the
+    // low end of the same pool. Rather than chasing ever more distinguishing
+    // signals, bound how long a cached answer may be trusted.
+    property real egressFetchedAtMs: 0
+    readonly property int egressMaxAgeMs: 300000
+
+    // --- Text scale -------------------------------------------------------
+    // Every font size in the widget derives from this, so the whole popup
+    // scales from one number rather than needing eight edits.
+    readonly property real fontScale: 1.25
+    readonly property real baseFontSize: Kirigami.Theme.defaultFont.pixelSize * fontScale
 
     property int windowSecs: 60
     readonly property var windowOptions: [
@@ -398,6 +465,11 @@ PlasmoidItem {
 
         const result = {
             backendUp: data["BackendState"] === "Running",
+            // Whether *any* exit node is selected, which is a different
+            // question from whether ours is. Egress classification cares about
+            // the former (traffic is tunnelled regardless of which peer); the
+            // button cares about the latter.
+            anyActive: !!data["ExitNodeStatus"],
             peerFound: false,
             approved: false,
             peerOnline: false,
@@ -439,11 +511,151 @@ PlasmoidItem {
         }
         exitNodeStatusOk = true;
         exitNodeBackendUp = parsed.backendUp;
+        exitNodeAnyActive = parsed.anyActive;
         exitNodePeerFound = parsed.peerFound;
         exitNodeApproved = parsed.approved;
         exitNodePeerOnline = parsed.peerOnline;
         exitNodeOn = parsed.on;
         exitNodeIp = parsed.ip;
+    }
+
+    // Identity of the path packets to the internet actually take, read from
+    // `ip route get <probe>` rather than the default route.
+    //
+    // The default route is the wrong thing to watch. A VPN — including this
+    // widget's own Tailscale exit node — redirects egress through policy
+    // routing or a split default (0.0.0.0/1 + 128.0.0.0/1) while leaving the
+    // physical `default` line untouched, so keying off it would miss the
+    // change entirely. `route get` resolves the effective route: with the exit
+    // node engaged it reports `dev tailscale0 table 52` while `show default`
+    // still reports the wifi gateway.
+    //
+    // via/dev/table/src together also cover the plain roaming case, since two
+    // networks sharing a gateway address still differ in interface or lease.
+    // `uid` and the trailing `cache` line are constant noise and excluded.
+    function parseRouteFingerprint(rawText) {
+        const lines = (rawText || "").split(/\r?\n/);
+        for (const line of lines) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length < 3 || parts[0] !== root.cloudflareHost) {
+                continue;
+            }
+            var via = "";
+            var dev = "";
+            var table = "";
+            var src = "";
+            for (var i = 1; i < parts.length - 1; ++i) {
+                if (parts[i] === "via") {
+                    via = parts[i + 1];
+                } else if (parts[i] === "dev") {
+                    dev = parts[i + 1];
+                } else if (parts[i] === "table") {
+                    table = parts[i + 1];
+                } else if (parts[i] === "src") {
+                    src = parts[i + 1];
+                }
+            }
+            return via + "|" + dev + "|" + table + "|" + src;
+        }
+        return "";
+    }
+
+    // ipinfo returns `org` as "AS<number> <Legal Entity Name>", which is too
+    // long for the popup and mostly noise. Reduce it to the recognisable part.
+    //
+    // Stripping the ASN and the corporate suffix, then taking the first word,
+    // handles most ISPs: "AS7922 Comcast Cable Communications, LLC" -> Comcast,
+    // "AS21928 T-Mobile USA, Inc." -> T-Mobile, "AS63182 RapidScale, Inc" ->
+    // RapidScale. It cannot recover a trade name that shares no prefix with
+    // the legal name, so those need an explicit entry — Starlink's operator
+    // registers as "Space Exploration Technologies Corporation", which the
+    // heuristic would render as "Space".
+    readonly property var orgAliases: ({
+        "space exploration technologies": "SpaceX"
+    })
+
+    function abbreviateOrg(rawOrg) {
+        var text = String(rawOrg || "").trim();
+        if (text.length === 0) {
+            return "";
+        }
+        text = text.replace(/^AS\d+\s+/i, "");
+        text = text.replace(/[,\s]+(inc|llc|l\.l\.c|ltd|limited|corp|corporation|company|co|plc|gmbh|ag|sa|bv|nv)\.?$/i, "");
+
+        const lowered = text.toLowerCase();
+        for (const key in orgAliases) {
+            if (lowered.indexOf(key) === 0) {
+                return orgAliases[key];
+            }
+        }
+        return text.split(/\s+/)[0].replace(/,+$/, "");
+    }
+
+    function parseEgress(rawText) {
+        var data;
+        try {
+            data = JSON.parse(rawText || "");
+        } catch (e) {
+            return null;
+        }
+        if (!data || typeof data !== "object" || !data["ip"]) {
+            return null;
+        }
+        return {
+            ip: String(data["ip"]),
+            org: abbreviateOrg(data["org"])
+        };
+    }
+
+    function applyEgress(parsed) {
+        if (!parsed) {
+            egressOk = false;
+            return;
+        }
+        // Routing moved while this request was in flight, so the address it
+        // returned describes a path we are no longer on. Discard it and go
+        // again rather than publishing an answer to a stale question. Both
+        // halves matter: the exit node can flip, and the ordinary route can
+        // change under it without the exit node moving at all.
+        if (exitNodeAnyActive !== egressRequestViaExitNode
+                || routeFingerprint !== egressRequestFingerprint) {
+            invalidateEgress();
+            return;
+        }
+        egressOk = true;
+        egressStale = false;
+        egressFetchedAtMs = Date.now();
+        egressIp = parsed.ip;
+        egressOrg = parsed.org;
+        // Taken at dispatch, not now, so the label can never colour itself
+        // for a state its text doesn't reflect.
+        egressViaExitNode = egressRequestViaExitNode;
+    }
+
+    // Both triggers mean the displayed identity may no longer be true. Mark it
+    // stale rather than clearing it: hiding the label outright would shift the
+    // layout for the few seconds a lookup takes, whereas dimming keeps the row
+    // stable while still signalling "re-checking".
+    function invalidateEgress() {
+        egressStale = true;
+        egressRefreshDebounce.restart();
+    }
+
+    function refreshEgress() {
+        if (!samplingActive) {
+            return;
+        }
+        // Deliberately not gated on exitNodeStatusOk. A transient `tailscale
+        // status` failure leaves exitNodeOn holding its last known value,
+        // which is still the best available description of how curl will
+        // actually leave; folding in the validity flag would instead classify
+        // the request as direct while it demonstrably traverses the exit node.
+        // That error would also be sticky — exitNodeOn never changed, so
+        // onExitNodeOnChanged would never fire to correct it.
+        egressRequestViaExitNode = exitNodeAnyActive;
+        egressRequestFingerprint = routeFingerprint;
+        executableSource.disconnectSource(egressCommand);
+        executableSource.connectSource(egressCommand);
     }
 
     function refreshExitNode() {
@@ -518,6 +730,15 @@ PlasmoidItem {
         onTriggered: {
             root.refreshGateway()
             root.refreshExitNode()
+            // Retry a failed identity lookup, but only while someone is
+            // looking. A timeout or a captive-portal interception otherwise
+            // leaves the label absent for as long as the popup stays open,
+            // since nothing else re-triggers until the route changes. Bounded
+            // by the popup's lifetime and this timer's 30 s period, so a
+            // persistently failing lookup can't hammer the third party.
+            if (root.expanded && !root.egressOk) {
+                root.refreshEgress()
+            }
         }
     }
 
@@ -527,6 +748,19 @@ PlasmoidItem {
     // exitNodeActionable requires !exitNodeBusy the button would stay dead
     // until the widget is reloaded. Release the flag on a watchdog and re-poll
     // so the UI recovers on its own.
+    // Coalesces egress re-lookups. Both triggers (exit node flipped, gateway
+    // changed) often fire together, and routing needs a moment to settle after
+    // either — querying instantly would return the address we just left.
+    Timer {
+        id: egressRefreshDebounce
+        interval: 2500
+        repeat: false
+        onTriggered: root.refreshEgress()
+    }
+
+    onExitNodeAnyActiveChanged: invalidateEgress()
+    onRouteFingerprintChanged: invalidateEgress()
+
     Timer {
         id: exitNodeBusyTimeout
         interval: 15000
@@ -552,12 +786,23 @@ PlasmoidItem {
                 root.applyPing("google", root.parsePingMs(stdout));
             } else if (sourceName === root.gatewayLookupCommand) {
                 const ip = root.parseGatewayIp(stdout);
+                // Keep the last known fingerprint if the probe produced
+                // nothing — `route get` can transiently fail while an
+                // interface is reconfiguring, and letting that write an empty
+                // value would invalidate the egress cache on every blip.
+                const fingerprint = root.parseRouteFingerprint(stdout);
+                if (fingerprint.length > 0) {
+                    root.routeFingerprint = fingerprint;
+                }
                 root.updateGatewayIp(ip);
                 root.gatewayCommand = ip.length > 0
                         ? "ping -n -c 1 -W 1 " + ip
                         : "";
             } else if (sourceName === root.gatewayCommand && root.gatewayCommand.length > 0) {
                 root.applyPing("gateway", root.parsePingMs(stdout));
+            } else if (sourceName === root.egressCommand) {
+                const egressFailed = (sourceData["exit code"] || 0) !== 0;
+                root.applyEgress(egressFailed ? null : root.parseEgress(stdout));
             } else if (sourceName === root.exitNodeStatusCommand) {
                 const failed = (sourceData["exit code"] || 0) !== 0;
                 root.applyExitNodeStatus(failed ? null : root.parseExitNodeStatus(stdout));
@@ -590,6 +835,14 @@ PlasmoidItem {
             // The exit-node button is about to become clickable, so re-poll
             // rather than presenting state up to 30 s stale.
             refreshExitNode()
+            // Only when we have nothing to show, when what we have is known
+            // to be out of date, or when it has simply aged out. Re-querying
+            // on every popup open would hit a third party repeatedly to be
+            // told the same thing.
+            if (!egressOk || egressStale
+                    || (Date.now() - egressFetchedAtMs) > egressMaxAgeMs) {
+                refreshEgress()
+            }
         }
     }
 
@@ -657,7 +910,7 @@ PlasmoidItem {
                     Text {
                         text: "1.1.1.1"
                         color: Kirigami.Theme.textColor
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                        font.pixelSize: root.baseFontSize * 0.75
                         opacity: 0.8
                     }
                 }
@@ -668,7 +921,7 @@ PlasmoidItem {
                     Text {
                         text: "8.8.8.8"
                         color: Kirigami.Theme.textColor
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                        font.pixelSize: root.baseFontSize * 0.75
                         opacity: 0.8
                     }
                 }
@@ -685,13 +938,47 @@ PlasmoidItem {
                     }
                     Text {
                         text: root.gatewayIp
+                        textFormat: Text.PlainText
                         color: Kirigami.Theme.textColor
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                        font.pixelSize: root.baseFontSize * 0.75
                         opacity: 0.8
                     }
                 }
 
                 Item { Layout.fillWidth: true }
+
+                // Egress identity — who the internet currently sees us as.
+                // Coloured by routing so the distinction reads without parsing
+                // the text: amber means traffic is leaving via the exit node,
+                // muted means it is going out locally.
+                Text {
+                    visible: root.egressOk && text.length > 0
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 14
+                    text: {
+                        if (!root.egressOk) {
+                            return ""
+                        }
+                        if (root.egressOrg.length > 0 && root.egressIp.length > 0) {
+                            return root.egressOrg + " · " + root.egressIp
+                        }
+                        return root.egressOrg.length > 0 ? root.egressOrg : root.egressIp
+                    }
+                    // Snapshot, not live state — see egressViaExitNode.
+                    color: root.egressViaExitNode
+                            ? "#ffd54a"
+                            : Qt.rgba(1, 1, 1, 0.55)
+                    // Dimmed while a re-lookup is pending, so the moment
+                    // between "route changed" and "new answer arrived" reads
+                    // as provisional rather than as fact.
+                    opacity: root.egressStale ? 0.45 : 1.0
+                    // egressOrg and egressIp come from an HTTP response.
+                    // Text.AutoText would interpret crafted markup as rich
+                    // text and can load inline images, so pin it to literal
+                    // text — matching toolTipTextFormat elsewhere in the file.
+                    textFormat: Text.PlainText
+                    font.pixelSize: root.baseFontSize * 0.75
+                    elide: Text.ElideRight
+                }
 
                 // Tailscale exit-node toggle. Shares the pill idiom of the
                 // window-range buttons below, and greys out whenever the
@@ -733,7 +1020,7 @@ PlasmoidItem {
                             }
                             return Qt.rgba(1, 1, 1, 0.75)
                         }
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.64
+                        font.pixelSize: root.baseFontSize * 0.64
                     }
 
                     MouseArea {
@@ -781,7 +1068,7 @@ PlasmoidItem {
                             y: -height
                             text: ((root.gridIntervals - index) * root.axisStepMs()) + " ms"
                             color: Qt.rgba(1, 1, 1, 0.45)
-                            font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.85
+                            font.pixelSize: root.baseFontSize * 0.85
                             opacity: 1
                         }
                     }
@@ -803,7 +1090,7 @@ PlasmoidItem {
                     readonly property real rightMargin: 58
                     readonly property real chartW: Math.max(0, width - rightMargin)
                     readonly property real chartH: Math.max(0, height - padY * 2)
-                    readonly property real publicRealtimeLabelFontSize: Kirigami.Theme.defaultFont.pixelSize * 1.3
+                    readonly property real publicRealtimeLabelFontSize: root.baseFontSize * 1.3
                     // Gateway has one extra character (e.g. "1.1ms"), so scale down to match public-label width.
                     readonly property real gatewayRealtimeLabelFontSize: publicRealtimeLabelFontSize * 0.8
                     // 4px sampling keeps point count low while remaining visually smooth.
@@ -1515,7 +1802,7 @@ PlasmoidItem {
                             id: maxText
                             anchors.centerIn: parent
                             color: "#ffdd44"
-                            font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.2
+                            font.pixelSize: root.baseFontSize * 1.2
                             font.bold: true
                             text: chartView.cachedMax >= 0 ? chartView.cachedMax.toFixed(1) + " ms" : ""
                         }
@@ -1549,7 +1836,7 @@ PlasmoidItem {
                             id: minText
                             anchors.centerIn: parent
                             color: "#ffdd44"
-                            font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.2
+                            font.pixelSize: root.baseFontSize * 1.2
                             font.bold: true
                             text: chartView.cachedMin >= 0 ? chartView.cachedMin.toFixed(1) + " ms" : ""
                         }
@@ -1631,7 +1918,7 @@ PlasmoidItem {
                     verticalAlignment: Text.AlignVCenter
                     text: "Last Internet Ping Received: " + root.lastPingReceivedText
                     color: Qt.rgba(1, 1, 1, 0.45)
-                    font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                    font.pixelSize: root.baseFontSize * 0.75
                     elide: Text.ElideRight
                     opacity: 1
                 }
@@ -1657,7 +1944,7 @@ PlasmoidItem {
                                 anchors.centerIn: parent
                                 text: modelData.label
                                 color: active ? "#ffd54a" : Qt.rgba(1, 1, 1, 0.75)
-                                font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.64
+                                font.pixelSize: root.baseFontSize * 0.64
                             }
 
                             MouseArea {
@@ -1687,6 +1974,7 @@ PlasmoidItem {
                 if (gatewayCommand.length > 0) {
                     executableSource.disconnectSource(gatewayCommand)
                 }
+                executableSource.disconnectSource(egressCommand)
                 executableSource.disconnectSource(exitNodeStatusCommand)
                 executableSource.disconnectSource(exitNodeOnCommand)
                 executableSource.disconnectSource(exitNodeOffCommand)

@@ -5,6 +5,47 @@ All notable changes to Ping Monitor are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-08-17
+
+### Added
+
+- **Egress identity in the legend row.** Shows the abbreviated ISP and
+  public IP of wherever your traffic is actually leaving from, e.g.
+  `SpaceX · 98.97.42.196`. Coloured by routing — amber while leaving via
+  the exit node, muted while going out locally — so the distinction reads
+  without parsing the text.
+
+  ipinfo returns `org` as `AS<number> <Legal Entity Name>`, which is too
+  long for the popup and mostly noise. Stripping the ASN and a trailing
+  corporate suffix, then taking the first word, handles most providers:
+  `AS7922 Comcast Cable Communications, LLC` → Comcast,
+  `AS21928 T-Mobile USA, Inc.` → T-Mobile, `AS7018 AT&T Services, Inc.`
+  → AT&T.
+
+  That rule cannot recover a trade name sharing no prefix with the legal
+  name, so those get an explicit alias. Starlink is the motivating case:
+  its operator registers as `Space Exploration Technologies Corporation`,
+  which the heuristic alone renders as "Space" — a real word that looks
+  like a plausible brand, so it would read as correct while being wrong.
+
+### Changed
+
+- **All popup text is larger.** Every font size now derives from a single
+  `fontScale` (1.25) via `baseFontSize`, rather than eight independently
+  hardcoded multipliers. Previous sizes were hard to read at a glance,
+  and the scale is now adjustable from one number.
+
+### Notes
+
+- The egress lookup queries `ipinfo.io`, so your address is visible to a
+  third party. Unavoidable for a public-IP display — only an outside
+  observer can answer the question.
+- It is deliberately not on a timer. The answer only changes when the
+  exit node flips or the underlying network does, so refresh is driven by
+  those two events (debounced 2.5 s, since routing needs a moment to
+  settle or it would re-read the address just left) plus popup expand
+  when nothing is cached yet. Repeated opens do not re-query.
+
 ## [2.1.0] — 2026-08-17
 
 ### Added
