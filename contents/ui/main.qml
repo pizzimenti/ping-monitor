@@ -88,8 +88,13 @@ PlasmoidItem {
     property bool exitNodePeerFound: false
     property bool exitNodeApproved: false
     property bool exitNodePeerOnline: false
-    // Exit node engaged (per tailscaled, not per our own last click).
+    // Our configured host is the selected exit node. Drives the button.
     property bool exitNodeOn: false
+    // Some exit node is selected — not necessarily ours. Drives the egress
+    // classification, because traffic is tunnelled whichever peer was chosen,
+    // and a node picked from the CLI or another device would otherwise be
+    // rendered as direct egress.
+    property bool exitNodeAnyActive: false
     // A set command is in flight; suppresses double-fires and re-polls.
     property bool exitNodeBusy: false
     property string exitNodeIp: ""
@@ -188,6 +193,14 @@ PlasmoidItem {
     // widget would keep asserting the previous network's ISP. Interface and
     // local source address disambiguate.
     property string routeFingerprint: ""
+
+    // Backstop for network changes the fingerprint structurally cannot see:
+    // two networks can genuinely present the same interface, gateway, and
+    // lease, since consumer routers ship identical defaults and hand out the
+    // low end of the same pool. Rather than chasing ever more distinguishing
+    // signals, bound how long a cached answer may be trusted.
+    property real egressFetchedAtMs: 0
+    readonly property int egressMaxAgeMs: 300000
 
     // --- Text scale -------------------------------------------------------
     // Every font size in the widget derives from this, so the whole popup
@@ -452,6 +465,11 @@ PlasmoidItem {
 
         const result = {
             backendUp: data["BackendState"] === "Running",
+            // Whether *any* exit node is selected, which is a different
+            // question from whether ours is. Egress classification cares about
+            // the former (traffic is tunnelled regardless of which peer); the
+            // button cares about the latter.
+            anyActive: !!data["ExitNodeStatus"],
             peerFound: false,
             approved: false,
             peerOnline: false,
@@ -493,6 +511,7 @@ PlasmoidItem {
         }
         exitNodeStatusOk = true;
         exitNodeBackendUp = parsed.backendUp;
+        exitNodeAnyActive = parsed.anyActive;
         exitNodePeerFound = parsed.peerFound;
         exitNodeApproved = parsed.approved;
         exitNodePeerOnline = parsed.peerOnline;
@@ -598,13 +617,14 @@ PlasmoidItem {
         // again rather than publishing an answer to a stale question. Both
         // halves matter: the exit node can flip, and the ordinary route can
         // change under it without the exit node moving at all.
-        if (exitNodeOn !== egressRequestViaExitNode
+        if (exitNodeAnyActive !== egressRequestViaExitNode
                 || routeFingerprint !== egressRequestFingerprint) {
             invalidateEgress();
             return;
         }
         egressOk = true;
         egressStale = false;
+        egressFetchedAtMs = Date.now();
         egressIp = parsed.ip;
         egressOrg = parsed.org;
         // Taken at dispatch, not now, so the label can never colour itself
@@ -632,7 +652,7 @@ PlasmoidItem {
         // the request as direct while it demonstrably traverses the exit node.
         // That error would also be sticky — exitNodeOn never changed, so
         // onExitNodeOnChanged would never fire to correct it.
-        egressRequestViaExitNode = exitNodeOn;
+        egressRequestViaExitNode = exitNodeAnyActive;
         egressRequestFingerprint = routeFingerprint;
         executableSource.disconnectSource(egressCommand);
         executableSource.connectSource(egressCommand);
@@ -738,7 +758,7 @@ PlasmoidItem {
         onTriggered: root.refreshEgress()
     }
 
-    onExitNodeOnChanged: invalidateEgress()
+    onExitNodeAnyActiveChanged: invalidateEgress()
     onRouteFingerprintChanged: invalidateEgress()
 
     Timer {
@@ -815,10 +835,12 @@ PlasmoidItem {
             // The exit-node button is about to become clickable, so re-poll
             // rather than presenting state up to 30 s stale.
             refreshExitNode()
-            // Only when we have nothing to show, or what we have is known to
-            // be out of date. Re-querying on every popup open would hit a
-            // third party repeatedly to be told the same thing.
-            if (!egressOk || egressStale) {
+            // Only when we have nothing to show, when what we have is known
+            // to be out of date, or when it has simply aged out. Re-querying
+            // on every popup open would hit a third party repeatedly to be
+            // told the same thing.
+            if (!egressOk || egressStale
+                    || (Date.now() - egressFetchedAtMs) > egressMaxAgeMs) {
                 refreshEgress()
             }
         }
