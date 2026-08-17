@@ -154,6 +154,23 @@ PlasmoidItem {
     property string egressIp: ""
     property string egressOrg: ""
     property bool egressOk: false
+    // Whether the exit node was engaged at the moment these values were read.
+    // The label's colour derives from this rather than the live exitNodeOn, so
+    // colour and text always describe the same observation — binding colour to
+    // live state made it flip seconds before the text caught up, briefly
+    // showing "tunnelled" styling over the previous network's address.
+    property bool egressViaExitNode: false
+    // Current values may no longer describe the current network. Set when the
+    // default route or the exit node changes, cleared once a fresh lookup
+    // lands. Drives both the dimmed presentation and the expand-time refetch.
+    property bool egressStale: false
+
+    // Identity of the default route, not just its gateway address. Roaming
+    // between two networks that both use 192.168.1.1 leaves the gateway
+    // unchanged, so keying off it alone would never notice the move and the
+    // widget would keep asserting the previous network's ISP. Interface and
+    // local source address disambiguate.
+    property string routeFingerprint: ""
 
     // --- Text scale -------------------------------------------------------
     // Every font size in the widget derives from this, so the whole popup
@@ -466,6 +483,33 @@ PlasmoidItem {
         exitNodeIp = parsed.ip;
     }
 
+    // Build a stable identity for the default route from `via`, `dev`, and
+    // `src`. Two different networks sharing a gateway address will still
+    // almost always differ in interface or DHCP lease.
+    function parseRouteFingerprint(rawText) {
+        const lines = (rawText || "").split(/\r?\n/);
+        for (const line of lines) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length < 3 || parts[0] !== "default") {
+                continue;
+            }
+            var via = "";
+            var dev = "";
+            var src = "";
+            for (var i = 1; i < parts.length - 1; ++i) {
+                if (parts[i] === "via") {
+                    via = parts[i + 1];
+                } else if (parts[i] === "dev") {
+                    dev = parts[i + 1];
+                } else if (parts[i] === "src") {
+                    src = parts[i + 1];
+                }
+            }
+            return via + "|" + dev + "|" + src;
+        }
+        return "";
+    }
+
     // ipinfo returns `org` as "AS<number> <Legal Entity Name>", which is too
     // long for the popup and mostly noise. Reduce it to the recognisable part.
     //
@@ -519,8 +563,21 @@ PlasmoidItem {
             return;
         }
         egressOk = true;
+        egressStale = false;
         egressIp = parsed.ip;
         egressOrg = parsed.org;
+        // Snapshot the routing that produced these values, so the label can
+        // never colour itself for a state its text doesn't reflect.
+        egressViaExitNode = exitNodeStatusOk && exitNodeOn;
+    }
+
+    // Both triggers mean the displayed identity may no longer be true. Mark it
+    // stale rather than clearing it: hiding the label outright would shift the
+    // layout for the few seconds a lookup takes, whereas dimming keeps the row
+    // stable while still signalling "re-checking".
+    function invalidateEgress() {
+        egressStale = true;
+        egressRefreshDebounce.restart();
     }
 
     function refreshEgress() {
@@ -622,8 +679,8 @@ PlasmoidItem {
         onTriggered: root.refreshEgress()
     }
 
-    onExitNodeOnChanged: egressRefreshDebounce.restart()
-    onGatewayIpChanged: egressRefreshDebounce.restart()
+    onExitNodeOnChanged: invalidateEgress()
+    onRouteFingerprintChanged: invalidateEgress()
 
     Timer {
         id: exitNodeBusyTimeout
@@ -650,6 +707,7 @@ PlasmoidItem {
                 root.applyPing("google", root.parsePingMs(stdout));
             } else if (sourceName === root.gatewayLookupCommand) {
                 const ip = root.parseGatewayIp(stdout);
+                root.routeFingerprint = root.parseRouteFingerprint(stdout);
                 root.updateGatewayIp(ip);
                 root.gatewayCommand = ip.length > 0
                         ? "ping -n -c 1 -W 1 " + ip
@@ -691,11 +749,10 @@ PlasmoidItem {
             // The exit-node button is about to become clickable, so re-poll
             // rather than presenting state up to 30 s stale.
             refreshExitNode()
-            // Only when we have nothing to show. The change-driven triggers
-            // already cover the cases where the answer can differ, so
-            // re-querying on every popup open would hit a third party
-            // repeatedly to be told the same thing.
-            if (!egressOk) {
+            // Only when we have nothing to show, or what we have is known to
+            // be out of date. Re-querying on every popup open would hit a
+            // third party repeatedly to be told the same thing.
+            if (!egressOk || egressStale) {
                 refreshEgress()
             }
         }
@@ -793,6 +850,7 @@ PlasmoidItem {
                     }
                     Text {
                         text: root.gatewayIp
+                        textFormat: Text.PlainText
                         color: Kirigami.Theme.textColor
                         font.pixelSize: root.baseFontSize * 0.75
                         opacity: 0.8
@@ -817,9 +875,19 @@ PlasmoidItem {
                         }
                         return root.egressOrg.length > 0 ? root.egressOrg : root.egressIp
                     }
-                    color: (root.exitNodeStatusOk && root.exitNodeOn)
+                    // Snapshot, not live state — see egressViaExitNode.
+                    color: root.egressViaExitNode
                             ? "#ffd54a"
                             : Qt.rgba(1, 1, 1, 0.55)
+                    // Dimmed while a re-lookup is pending, so the moment
+                    // between "route changed" and "new answer arrived" reads
+                    // as provisional rather than as fact.
+                    opacity: root.egressStale ? 0.45 : 1.0
+                    // egressOrg and egressIp come from an HTTP response.
+                    // Text.AutoText would interpret crafted markup as rich
+                    // text and can load inline images, so pin it to literal
+                    // text — matching toolTipTextFormat elsewhere in the file.
+                    textFormat: Text.PlainText
                     font.pixelSize: root.baseFontSize * 0.75
                     elide: Text.ElideRight
                 }

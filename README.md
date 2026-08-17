@@ -36,6 +36,12 @@ glance; click it for a popup with the rolling-window latency chart.
 - KDE Plasma 6 (`X-Plasma-API-Minimum-Version: 6.0`)
 - `kpackagetool6`
 - `ping` and `ip` (typically provided by `iputils` and `iproute2`)
+- `curl` — for the egress identity lookup. Without it the ISP/public-IP
+  label simply never appears; everything else works.
+- `tailscale` — only for the exit-node toggle. Without it the toggle stays
+  greyed out. Flipping the exit node also requires `OperatorUser` to be set
+  to the desktop user (`tailscale set --operator=$USER`), otherwise
+  `tailscale set` needs a root the widget does not have.
 
 ## Installation
 
