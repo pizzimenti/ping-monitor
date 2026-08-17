@@ -129,6 +129,13 @@ PlasmoidItem {
         if (!exitNodePeerOnline) {
             return exitNodeHost + " is offline"
         }
+        // Reported last, so a specific diagnosis above wins. What lands here is
+        // the confusing case: everything looks healthy but `tailscale set` was
+        // rejected anyway — e.g. OperatorUser cleared, so the command needs a
+        // root the widget doesn't have.
+        if (exitNodeFailed) {
+            return "Last change was rejected by tailscale"
+        }
         return exitNodeOn
                 ? "Routing via " + exitNodeHost
                 : "Direct egress"
@@ -231,8 +238,11 @@ PlasmoidItem {
             }
         }
         // Only worth a line when engaged — "not using an exit node" is the
-        // default state and doesn't need saying on every hover.
-        if (exitNodeOn) {
+        // default state and doesn't need saying on every hover. Gated on the
+        // poll having succeeded too: exitNodeOn holds its last value when a
+        // poll fails, and asserting stale routing here would contradict the
+        // popup, which drops to a neutral label in the same situation.
+        if (exitNodeStatusOk && exitNodeOn) {
             lines.push("Exit node: " + exitNodeHost
                     + (exitNodePeerOnline ? "" : " (offline)"))
         }
@@ -453,6 +463,7 @@ PlasmoidItem {
         const command = exitNodeOn ? exitNodeOffCommand : exitNodeOnCommand;
         executableSource.disconnectSource(command);
         executableSource.connectSource(command);
+        exitNodeBusyTimeout.restart();
     }
 
     function spawnPing(command) {
@@ -510,6 +521,25 @@ PlasmoidItem {
         }
     }
 
+    // The ping forks self-cap via `-W 1`, but `tailscale set` has no timeout —
+    // it blocks for as long as the backend takes. A wedged or unspawnable
+    // tailscaled would therefore leave exitNodeBusy latched, and since
+    // exitNodeActionable requires !exitNodeBusy the button would stay dead
+    // until the widget is reloaded. Release the flag on a watchdog and re-poll
+    // so the UI recovers on its own.
+    Timer {
+        id: exitNodeBusyTimeout
+        interval: 15000
+        repeat: false
+        onTriggered: {
+            if (root.exitNodeBusy) {
+                root.exitNodeBusy = false
+                root.exitNodeFailed = true
+                root.refreshExitNode()
+            }
+        }
+    }
+
     Plasma5Support.DataSource {
         id: executableSource
         engine: "executable"
@@ -534,6 +564,7 @@ PlasmoidItem {
             } else if (sourceName === root.exitNodeOnCommand || sourceName === root.exitNodeOffCommand) {
                 // `tailscale set` blocks until the backend has applied the
                 // pref, so the state re-poll below is not racing the change.
+                exitNodeBusyTimeout.stop();
                 root.exitNodeBusy = false;
                 root.exitNodeFailed = (sourceData["exit code"] || 0) !== 0;
                 root.refreshExitNode();
