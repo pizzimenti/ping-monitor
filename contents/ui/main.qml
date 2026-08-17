@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import QtQuick.Shapes
 import org.kde.plasma.plasmoid
@@ -54,6 +55,84 @@ PlasmoidItem {
     readonly property string googleCommand: "ping -n -c 1 -W 1 " + googleHost
     property string gatewayCommand: ""
     readonly property string gatewayLookupCommand: "ip -4 route show default"
+
+    // --- Tailscale exit node ---------------------------------------------
+    // Toggling routes all egress through a peer on the tailnet. Useful on
+    // hostile/low-reputation guest wifi (captive-portal networks that NAT
+    // through a datacenter ASN), where services see a bot-like source IP.
+    //
+    // `tailscale set` normally needs root, but ithilien has OperatorUser set
+    // to the desktop user, so plasmashell can drive it with no polkit prompt.
+    // If that pref is ever cleared the set commands fail with a non-zero exit
+    // and the button reverts — it will not silently appear to work.
+    readonly property string exitNodeHost: "mistral"
+    // Peers are needed, not just top-level ExitNodeStatus: eligibility lives on
+    // the peer entry (ExitNodeOption), and without it we can't tell "not
+    // approved as an exit node" from "approved but not selected".
+    readonly property string exitNodeStatusCommand: "tailscale status --json"
+    readonly property string exitNodeOnCommand: "tailscale set --exit-node=" + exitNodeHost + " --exit-node-allow-lan-access"
+    readonly property string exitNodeOffCommand: "tailscale set --exit-node="
+
+    // Did the last status poll produce usable output? False when tailscaled is
+    // down or the binary is missing, which is distinct from "off" — we don't
+    // know the state, so the button greys out rather than inviting a click.
+    property bool exitNodeStatusOk: false
+    // tailscaled's BackendState is "Running"; false while logged out, stopped,
+    // or still starting.
+    property bool exitNodeBackendUp: false
+    // The configured peer exists and the tailnet has approved it to offer
+    // exit-node service (admin console "Use as exit node").
+    property bool exitNodePeerFound: false
+    property bool exitNodeApproved: false
+    property bool exitNodePeerOnline: false
+    // Exit node engaged (per tailscaled, not per our own last click).
+    property bool exitNodeOn: false
+    // A set command is in flight; suppresses double-fires and re-polls.
+    property bool exitNodeBusy: false
+    property string exitNodeIp: ""
+    property bool exitNodeFailed: false
+
+    // Usable as a target to switch ON. Requires the peer to be reachable —
+    // selecting an offline exit node is legal in Tailscale but blackholes all
+    // egress, so the button refuses rather than handing the user a dead link.
+    readonly property bool exitNodeAvailable: exitNodeStatusOk
+            && exitNodeBackendUp && exitNodePeerFound && exitNodeApproved
+            && exitNodePeerOnline
+
+    // Clickable. Turning OFF must stay possible even when the peer has gone
+    // offline or lost approval — that is exactly the state where egress is
+    // blackholed and the user most needs the escape hatch. Only an in-flight
+    // command or a failed status poll blocks it.
+    readonly property bool exitNodeActionable: !exitNodeBusy
+            && exitNodeStatusOk
+            && (exitNodeOn || exitNodeAvailable)
+
+    readonly property string exitNodeReason: {
+        if (exitNodeBusy) {
+            return "Applying…"
+        }
+        if (!exitNodeStatusOk) {
+            return "Tailscale status unavailable"
+        }
+        if (!exitNodeBackendUp) {
+            return "Tailscale is not connected"
+        }
+        if (!exitNodePeerFound) {
+            return exitNodeHost + " is not on this tailnet"
+        }
+        if (!exitNodeApproved) {
+            return exitNodeHost + " is not an approved exit node"
+        }
+        if (exitNodeOn && !exitNodePeerOnline) {
+            return "Routing via " + exitNodeHost + " (peer offline)"
+        }
+        if (!exitNodePeerOnline) {
+            return exitNodeHost + " is offline"
+        }
+        return exitNodeOn
+                ? "Routing via " + exitNodeHost
+                : "Direct egress"
+    }
 
     property int windowSecs: 60
     readonly property var windowOptions: [
@@ -141,14 +220,21 @@ PlasmoidItem {
 
     toolTipMainText: "Ping Monitor"
     toolTipSubText: {
-        if (!hasAnyData) {
-            return "Waiting for first sample…"
-        }
         var lines = []
-        lines.push("1.1.1.1: " + (cloudflareUp ? currentCloudflarePing.toFixed(0) + " ms" : "timeout"))
-        lines.push("8.8.8.8: " + (googleUp ? currentGooglePing.toFixed(0) + " ms" : "timeout"))
-        if (gatewayIp.length > 0) {
-            lines.push(gatewayIp + ": " + (currentGatewayPing >= 0 ? currentGatewayPing.toFixed(0) + " ms" : "timeout"))
+        if (!hasAnyData) {
+            lines.push("Waiting for first sample…")
+        } else {
+            lines.push("1.1.1.1: " + (cloudflareUp ? currentCloudflarePing.toFixed(0) + " ms" : "timeout"))
+            lines.push("8.8.8.8: " + (googleUp ? currentGooglePing.toFixed(0) + " ms" : "timeout"))
+            if (gatewayIp.length > 0) {
+                lines.push(gatewayIp + ": " + (currentGatewayPing >= 0 ? currentGatewayPing.toFixed(0) + " ms" : "timeout"))
+            }
+        }
+        // Only worth a line when engaged — "not using an exit node" is the
+        // default state and doesn't need saying on every hover.
+        if (exitNodeOn) {
+            lines.push("Exit node: " + exitNodeHost
+                    + (exitNodePeerOnline ? "" : " (offline)"))
         }
         return lines.join("\n")
     }
@@ -267,6 +353,108 @@ PlasmoidItem {
         return "";
     }
 
+    // Pull exit-node state out of `tailscale status --json`. ExitNodeStatus is
+    // null when no exit node is selected, otherwise an object carrying the
+    // peer's reachability and tailnet addresses.
+    //
+    // Returns null (not an "off" result) when the output can't be parsed, so a
+    // transient failure — tailscaled restarting, the fork getting killed —
+    // leaves the button showing its last known good state instead of flapping
+    // to "off" and inviting a click that would toggle the wrong way.
+    // Entries may be bare ("100.90.1.121") or carry a prefix length
+    // ("100.90.1.121/32") depending on which part of the status blob they came
+    // from, so strip the suffix unconditionally.
+    function firstIPv4(addresses) {
+        const list = addresses || [];
+        for (var i = 0; i < list.length; ++i) {
+            const bare = String(list[i]).split("/")[0];
+            if (bare.indexOf(":") === -1) {
+                return bare;
+            }
+        }
+        return "";
+    }
+
+    function parseExitNodeStatus(rawText) {
+        var data;
+        try {
+            data = JSON.parse(rawText || "");
+        } catch (e) {
+            return null;
+        }
+        if (!data || typeof data !== "object") {
+            return null;
+        }
+
+        const result = {
+            backendUp: data["BackendState"] === "Running",
+            peerFound: false,
+            approved: false,
+            peerOnline: false,
+            on: false,
+            ip: ""
+        };
+
+        // Match on HostName, falling back to the MagicDNS name so a host whose
+        // tailnet hostname has been rewritten still resolves.
+        const wanted = root.exitNodeHost.toLowerCase();
+        const peers = data["Peer"] || {};
+        for (const key in peers) {
+            const peer = peers[key];
+            if (!peer) {
+                continue;
+            }
+            const hostName = String(peer["HostName"] || "").toLowerCase();
+            const dnsName = String(peer["DNSName"] || "").toLowerCase();
+            if (hostName !== wanted && dnsName.indexOf(wanted + ".") !== 0) {
+                continue;
+            }
+            result.peerFound = true;
+            result.approved = peer["ExitNodeOption"] === true;
+            result.peerOnline = peer["Online"] === true;
+            result.on = peer["ExitNode"] === true;
+            result.ip = firstIPv4(peer["TailscaleIPs"]);
+            break;
+        }
+        return result;
+    }
+
+    function applyExitNodeStatus(parsed) {
+        if (!parsed) {
+            // The poll failed — tailscaled down, binary missing, output
+            // truncated. We no longer know the real state, so drop to the
+            // disabled presentation instead of acting on stale flags.
+            exitNodeStatusOk = false;
+            return;
+        }
+        exitNodeStatusOk = true;
+        exitNodeBackendUp = parsed.backendUp;
+        exitNodePeerFound = parsed.peerFound;
+        exitNodeApproved = parsed.approved;
+        exitNodePeerOnline = parsed.peerOnline;
+        exitNodeOn = parsed.on;
+        exitNodeIp = parsed.ip;
+    }
+
+    function refreshExitNode() {
+        if (!samplingActive) {
+            return;
+        }
+        executableSource.disconnectSource(exitNodeStatusCommand);
+        executableSource.connectSource(exitNodeStatusCommand);
+    }
+
+    function toggleExitNode() {
+        if (!exitNodeActionable) {
+            return;
+        }
+        exitNodeBusy = true;
+        exitNodeFailed = false;
+        const command = exitNodeOn ? exitNodeOffCommand : exitNodeOnCommand;
+        executableSource.disconnectSource(command);
+        executableSource.connectSource(command);
+    }
+
     function spawnPing(command) {
         if (!command) {
             return;
@@ -306,13 +494,20 @@ PlasmoidItem {
         onTriggered: root.pingAllTargets()
     }
 
+    // Also drives the exit-node poll. Exit-node state only changes on explicit
+    // action (this button, the CLI, another device), so it rides the slow
+    // 30 s cadence rather than earning a timer of its own — one extra fork
+    // every 30 s against the three pings every 1–5 s the widget already spawns.
     Timer {
         id: gatewayRefreshTimer
         interval: 30000
         running: root.samplingActive
         repeat: true
         triggeredOnStart: true
-        onTriggered: root.refreshGateway()
+        onTriggered: {
+            root.refreshGateway()
+            root.refreshExitNode()
+        }
     }
 
     Plasma5Support.DataSource {
@@ -333,6 +528,15 @@ PlasmoidItem {
                         : "";
             } else if (sourceName === root.gatewayCommand && root.gatewayCommand.length > 0) {
                 root.applyPing("gateway", root.parsePingMs(stdout));
+            } else if (sourceName === root.exitNodeStatusCommand) {
+                const failed = (sourceData["exit code"] || 0) !== 0;
+                root.applyExitNodeStatus(failed ? null : root.parseExitNodeStatus(stdout));
+            } else if (sourceName === root.exitNodeOnCommand || sourceName === root.exitNodeOffCommand) {
+                // `tailscale set` blocks until the backend has applied the
+                // pref, so the state re-poll below is not racing the change.
+                root.exitNodeBusy = false;
+                root.exitNodeFailed = (sourceData["exit code"] || 0) !== 0;
+                root.refreshExitNode();
             }
             executableSource.disconnectSource(sourceName);
         }
@@ -352,6 +556,9 @@ PlasmoidItem {
         // next tick (which could be up to 10 s away if we were collapsed).
         if (root.expanded) {
             pingAllTargets()
+            // The exit-node button is about to become clickable, so re-poll
+            // rather than presenting state up to 30 s stale.
+            refreshExitNode()
         }
     }
 
@@ -454,6 +661,67 @@ PlasmoidItem {
                 }
 
                 Item { Layout.fillWidth: true }
+
+                // Tailscale exit-node toggle. Shares the pill idiom of the
+                // window-range buttons below, and greys out whenever the
+                // toggle can't be honoured — tailscaled down, peer missing,
+                // not approved by the tailnet, or unreachable.
+                Rectangle {
+                    id: exitNodeButton
+                    readonly property bool actionable: root.exitNodeActionable
+                    readonly property bool engaged: root.exitNodeOn
+
+                    Layout.preferredWidth: exitNodeText.implicitWidth + 12
+                    Layout.preferredHeight: exitNodeText.implicitHeight + 5
+                    radius: 3
+                    opacity: actionable ? 1.0 : 0.45
+                    color: engaged ? Qt.rgba(1, 1, 1, 0.20) : Qt.rgba(1, 1, 1, 0.08)
+                    border.width: 1
+                    border.color: engaged ? Qt.rgba(1, 1, 1, 0.45) : Qt.rgba(1, 1, 1, 0.18)
+
+                    Text {
+                        id: exitNodeText
+                        anchors.centerIn: parent
+                        // Neutral label while the state is unknown, so a failed
+                        // poll doesn't assert "direct" egress that we can't
+                        // actually vouch for.
+                        text: {
+                            if (!root.exitNodeStatusOk) {
+                                return "exit node"
+                            }
+                            return root.exitNodeOn
+                                    ? "via " + root.exitNodeHost
+                                    : "direct"
+                        }
+                        color: {
+                            if (root.exitNodeOn && !root.exitNodePeerOnline) {
+                                return Kirigami.Theme.negativeTextColor
+                            }
+                            if (root.exitNodeOn) {
+                                return "#ffd54a"
+                            }
+                            return Qt.rgba(1, 1, 1, 0.75)
+                        }
+                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.64
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: exitNodeButton.actionable
+                                ? Qt.PointingHandCursor
+                                : Qt.ArrowCursor
+                        // Swallow clicks rather than relying on the guard in
+                        // toggleExitNode(), so a disabled button gives no
+                        // press feedback at all.
+                        acceptedButtons: exitNodeButton.actionable
+                                ? Qt.LeftButton
+                                : Qt.NoButton
+                        onClicked: root.toggleExitNode()
+                        QQC2.ToolTip.visible: containsMouse
+                        QQC2.ToolTip.text: root.exitNodeReason
+                    }
+                }
             }
 
             Item {
@@ -1388,6 +1656,9 @@ PlasmoidItem {
                 if (gatewayCommand.length > 0) {
                     executableSource.disconnectSource(gatewayCommand)
                 }
+                executableSource.disconnectSource(exitNodeStatusCommand)
+                executableSource.disconnectSource(exitNodeOnCommand)
+                executableSource.disconnectSource(exitNodeOffCommand)
             }
         } catch (e) {}
     }
