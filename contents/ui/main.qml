@@ -54,7 +54,10 @@ PlasmoidItem {
     readonly property string cloudflareCommand: "ping -n -c 1 -W 1 " + cloudflareHost
     readonly property string googleCommand: "ping -n -c 1 -W 1 " + googleHost
     property string gatewayCommand: ""
-    readonly property string gatewayLookupCommand: "ip -4 route show default"
+    // Two probes in one fork. `show default` gives the gateway to ping;
+    // `route get` resolves how a packet to the internet would *actually*
+    // leave, which is a different question once policy routing is involved.
+    readonly property string gatewayLookupCommand: "ip -4 route show default; ip route get " + cloudflareHost
 
     // --- Tailscale exit node ---------------------------------------------
     // Toggling routes all egress through a peer on the tailnet. Useful on
@@ -160,6 +163,12 @@ PlasmoidItem {
     // live state made it flip seconds before the text caught up, briefly
     // showing "tunnelled" styling over the previous network's address.
     property bool egressViaExitNode: false
+    // Routing as it stood when the in-flight request was dispatched. The
+    // lookup has a five-second window, and reading the snapshot when the
+    // response lands would attribute the result to whatever routing exists by
+    // then — which, if the exit node flipped mid-request, is not the routing
+    // that produced the address.
+    property bool egressRequestViaExitNode: false
     // Current values may no longer describe the current network. Set when the
     // default route or the exit node changes, cleared once a fresh lookup
     // lands. Drives both the dimmed presentation and the expand-time refetch.
@@ -483,29 +492,43 @@ PlasmoidItem {
         exitNodeIp = parsed.ip;
     }
 
-    // Build a stable identity for the default route from `via`, `dev`, and
-    // `src`. Two different networks sharing a gateway address will still
-    // almost always differ in interface or DHCP lease.
+    // Identity of the path packets to the internet actually take, read from
+    // `ip route get <probe>` rather than the default route.
+    //
+    // The default route is the wrong thing to watch. A VPN — including this
+    // widget's own Tailscale exit node — redirects egress through policy
+    // routing or a split default (0.0.0.0/1 + 128.0.0.0/1) while leaving the
+    // physical `default` line untouched, so keying off it would miss the
+    // change entirely. `route get` resolves the effective route: with the exit
+    // node engaged it reports `dev tailscale0 table 52` while `show default`
+    // still reports the wifi gateway.
+    //
+    // via/dev/table/src together also cover the plain roaming case, since two
+    // networks sharing a gateway address still differ in interface or lease.
+    // `uid` and the trailing `cache` line are constant noise and excluded.
     function parseRouteFingerprint(rawText) {
         const lines = (rawText || "").split(/\r?\n/);
         for (const line of lines) {
             const parts = line.trim().split(/\s+/);
-            if (parts.length < 3 || parts[0] !== "default") {
+            if (parts.length < 3 || parts[0] !== root.cloudflareHost) {
                 continue;
             }
             var via = "";
             var dev = "";
+            var table = "";
             var src = "";
             for (var i = 1; i < parts.length - 1; ++i) {
                 if (parts[i] === "via") {
                     via = parts[i + 1];
                 } else if (parts[i] === "dev") {
                     dev = parts[i + 1];
+                } else if (parts[i] === "table") {
+                    table = parts[i + 1];
                 } else if (parts[i] === "src") {
                     src = parts[i + 1];
                 }
             }
-            return via + "|" + dev + "|" + src;
+            return via + "|" + dev + "|" + table + "|" + src;
         }
         return "";
     }
@@ -562,13 +585,20 @@ PlasmoidItem {
             egressOk = false;
             return;
         }
+        // Routing moved while this request was in flight, so the address it
+        // returned describes a path we are no longer on. Discard it and go
+        // again rather than publishing an answer to a stale question.
+        if ((exitNodeStatusOk && exitNodeOn) !== egressRequestViaExitNode) {
+            invalidateEgress();
+            return;
+        }
         egressOk = true;
         egressStale = false;
         egressIp = parsed.ip;
         egressOrg = parsed.org;
-        // Snapshot the routing that produced these values, so the label can
-        // never colour itself for a state its text doesn't reflect.
-        egressViaExitNode = exitNodeStatusOk && exitNodeOn;
+        // Taken at dispatch, not now, so the label can never colour itself
+        // for a state its text doesn't reflect.
+        egressViaExitNode = egressRequestViaExitNode;
     }
 
     // Both triggers mean the displayed identity may no longer be true. Mark it
@@ -584,6 +614,7 @@ PlasmoidItem {
         if (!samplingActive) {
             return;
         }
+        egressRequestViaExitNode = exitNodeStatusOk && exitNodeOn;
         executableSource.disconnectSource(egressCommand);
         executableSource.connectSource(egressCommand);
     }
@@ -707,7 +738,14 @@ PlasmoidItem {
                 root.applyPing("google", root.parsePingMs(stdout));
             } else if (sourceName === root.gatewayLookupCommand) {
                 const ip = root.parseGatewayIp(stdout);
-                root.routeFingerprint = root.parseRouteFingerprint(stdout);
+                // Keep the last known fingerprint if the probe produced
+                // nothing — `route get` can transiently fail while an
+                // interface is reconfiguring, and letting that write an empty
+                // value would invalidate the egress cache on every blip.
+                const fingerprint = root.parseRouteFingerprint(stdout);
+                if (fingerprint.length > 0) {
+                    root.routeFingerprint = fingerprint;
+                }
                 root.updateGatewayIp(ip);
                 root.gatewayCommand = ip.length > 0
                         ? "ping -n -c 1 -W 1 " + ip
