@@ -5,6 +5,52 @@ All notable changes to Ping Monitor are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-08-17
+
+### Added
+
+- **Tailscale exit-node toggle** in the popup's legend row. Routes all
+  egress through a peer on your tailnet and back, without dropping to a
+  terminal. Built for hostile guest wifi — captive-portal networks that
+  NAT through a datacenter ASN get treated as bot-like by upstream
+  services (captchas, forced re-auth, short-lived sessions), and routing
+  through a peer on a residential line clears it.
+
+  The toggle sits beside the latency it visibly changes: engaging the
+  exit node moves the 1.1.1.1 and 8.8.8.8 traces to the peer's RTT, so
+  the chart itself confirms the switch took effect.
+
+  - State is read from `tailscale status --json`, not tracked from the
+    last click, so changes made from the CLI or another device show up.
+  - Eligibility comes off the peer entry (`ExitNodeOption` / `Online` /
+    `ExitNode`), which distinguishes "not approved by the tailnet" from
+    "approved but not selected" — the top-level `ExitNodeStatus` cannot.
+  - The button greys out with a hover-tooltip reason when the toggle
+    can't be honoured: tailscaled down, peer absent, unapproved, or
+    unreachable. It stays clickable whenever the exit node is currently
+    engaged even if the peer has since gone offline, because that is
+    exactly the state where egress is blackholed and the escape hatch
+    matters most.
+  - A failed or unparseable poll presents as unknown rather than "off",
+    so a transient failure can't offer a button that toggles the wrong
+    way.
+  - Tray tooltip gains an `Exit node: <host>` line while engaged.
+
+  The exit-node host is currently a hardcoded property (`mistral`); there
+  is no configuration UI yet. Requires `OperatorUser` to be set to the
+  desktop user, otherwise `tailscale set` needs a root the widget does
+  not have — in that case the command is rejected and the button reverts
+  rather than appearing to work.
+
+### Notes
+
+- Polling adds one short-lived `tailscale status --json` fork every 30 s,
+  riding the existing gateway-refresh timer rather than adding one.
+- IPv6 egress through an exit node is not supported on a tailnet whose
+  peer doesn't forward it. Tailscale has no IPv4-only exit node —
+  `--advertise-exit-node` requires advertising both default routes — so
+  `::/0` is advertised but inert.
+
 ## [2.0.0] — 2026-05-15
 
 ### Breaking changes
