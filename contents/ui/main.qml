@@ -141,6 +141,26 @@ PlasmoidItem {
                 : "Direct egress"
     }
 
+    // --- Egress identity --------------------------------------------------
+    // Who the internet thinks we are. Only meaningful to look up from the
+    // outside, so this is the one thing the widget can't answer locally.
+    //
+    // Deliberately not on a timer: the answer only changes when the exit node
+    // flips or the underlying network does, and polling a third party on a
+    // schedule leaks our address more often than it needs to. Refresh is
+    // driven by those two events plus popup expand — i.e. when someone is
+    // actually looking.
+    readonly property string egressCommand: "curl -s --max-time 5 https://ipinfo.io/json"
+    property string egressIp: ""
+    property string egressOrg: ""
+    property bool egressOk: false
+
+    // --- Text scale -------------------------------------------------------
+    // Every font size in the widget derives from this, so the whole popup
+    // scales from one number rather than needing eight edits.
+    readonly property real fontScale: 1.25
+    readonly property real baseFontSize: Kirigami.Theme.defaultFont.pixelSize * fontScale
+
     property int windowSecs: 60
     readonly property var windowOptions: [
         { label: "1 min", secs: 60 },
@@ -446,6 +466,71 @@ PlasmoidItem {
         exitNodeIp = parsed.ip;
     }
 
+    // ipinfo returns `org` as "AS<number> <Legal Entity Name>", which is too
+    // long for the popup and mostly noise. Reduce it to the recognisable part.
+    //
+    // Stripping the ASN and the corporate suffix, then taking the first word,
+    // handles most ISPs: "AS7922 Comcast Cable Communications, LLC" -> Comcast,
+    // "AS21928 T-Mobile USA, Inc." -> T-Mobile, "AS63182 RapidScale, Inc" ->
+    // RapidScale. It cannot recover a trade name that shares no prefix with
+    // the legal name, so those need an explicit entry — Starlink's operator
+    // registers as "Space Exploration Technologies Corporation", which the
+    // heuristic would render as "Space".
+    readonly property var orgAliases: ({
+        "space exploration technologies": "SpaceX"
+    })
+
+    function abbreviateOrg(rawOrg) {
+        var text = String(rawOrg || "").trim();
+        if (text.length === 0) {
+            return "";
+        }
+        text = text.replace(/^AS\d+\s+/i, "");
+        text = text.replace(/[,\s]+(inc|llc|l\.l\.c|ltd|limited|corp|corporation|company|co|plc|gmbh|ag|sa|bv|nv)\.?$/i, "");
+
+        const lowered = text.toLowerCase();
+        for (const key in orgAliases) {
+            if (lowered.indexOf(key) === 0) {
+                return orgAliases[key];
+            }
+        }
+        return text.split(/\s+/)[0].replace(/,+$/, "");
+    }
+
+    function parseEgress(rawText) {
+        var data;
+        try {
+            data = JSON.parse(rawText || "");
+        } catch (e) {
+            return null;
+        }
+        if (!data || typeof data !== "object" || !data["ip"]) {
+            return null;
+        }
+        return {
+            ip: String(data["ip"]),
+            org: abbreviateOrg(data["org"])
+        };
+    }
+
+    function applyEgress(parsed) {
+        if (!parsed) {
+            egressOk = false;
+            return;
+        }
+        egressOk = true;
+        egressIp = parsed.ip;
+        egressOrg = parsed.org;
+    }
+
+    function refreshEgress() {
+        if (!samplingActive) {
+            return;
+        }
+        executableSource.disconnectSource(egressCommand);
+        executableSource.connectSource(egressCommand);
+    }
+
     function refreshExitNode() {
         if (!samplingActive) {
             return;
@@ -527,6 +612,19 @@ PlasmoidItem {
     // exitNodeActionable requires !exitNodeBusy the button would stay dead
     // until the widget is reloaded. Release the flag on a watchdog and re-poll
     // so the UI recovers on its own.
+    // Coalesces egress re-lookups. Both triggers (exit node flipped, gateway
+    // changed) often fire together, and routing needs a moment to settle after
+    // either — querying instantly would return the address we just left.
+    Timer {
+        id: egressRefreshDebounce
+        interval: 2500
+        repeat: false
+        onTriggered: root.refreshEgress()
+    }
+
+    onExitNodeOnChanged: egressRefreshDebounce.restart()
+    onGatewayIpChanged: egressRefreshDebounce.restart()
+
     Timer {
         id: exitNodeBusyTimeout
         interval: 15000
@@ -558,6 +656,9 @@ PlasmoidItem {
                         : "";
             } else if (sourceName === root.gatewayCommand && root.gatewayCommand.length > 0) {
                 root.applyPing("gateway", root.parsePingMs(stdout));
+            } else if (sourceName === root.egressCommand) {
+                const egressFailed = (sourceData["exit code"] || 0) !== 0;
+                root.applyEgress(egressFailed ? null : root.parseEgress(stdout));
             } else if (sourceName === root.exitNodeStatusCommand) {
                 const failed = (sourceData["exit code"] || 0) !== 0;
                 root.applyExitNodeStatus(failed ? null : root.parseExitNodeStatus(stdout));
@@ -590,6 +691,13 @@ PlasmoidItem {
             // The exit-node button is about to become clickable, so re-poll
             // rather than presenting state up to 30 s stale.
             refreshExitNode()
+            // Only when we have nothing to show. The change-driven triggers
+            // already cover the cases where the answer can differ, so
+            // re-querying on every popup open would hit a third party
+            // repeatedly to be told the same thing.
+            if (!egressOk) {
+                refreshEgress()
+            }
         }
     }
 
@@ -657,7 +765,7 @@ PlasmoidItem {
                     Text {
                         text: "1.1.1.1"
                         color: Kirigami.Theme.textColor
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                        font.pixelSize: root.baseFontSize * 0.75
                         opacity: 0.8
                     }
                 }
@@ -668,7 +776,7 @@ PlasmoidItem {
                     Text {
                         text: "8.8.8.8"
                         color: Kirigami.Theme.textColor
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                        font.pixelSize: root.baseFontSize * 0.75
                         opacity: 0.8
                     }
                 }
@@ -686,12 +794,35 @@ PlasmoidItem {
                     Text {
                         text: root.gatewayIp
                         color: Kirigami.Theme.textColor
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                        font.pixelSize: root.baseFontSize * 0.75
                         opacity: 0.8
                     }
                 }
 
                 Item { Layout.fillWidth: true }
+
+                // Egress identity — who the internet currently sees us as.
+                // Coloured by routing so the distinction reads without parsing
+                // the text: amber means traffic is leaving via the exit node,
+                // muted means it is going out locally.
+                Text {
+                    visible: root.egressOk && text.length > 0
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 14
+                    text: {
+                        if (!root.egressOk) {
+                            return ""
+                        }
+                        if (root.egressOrg.length > 0 && root.egressIp.length > 0) {
+                            return root.egressOrg + " · " + root.egressIp
+                        }
+                        return root.egressOrg.length > 0 ? root.egressOrg : root.egressIp
+                    }
+                    color: (root.exitNodeStatusOk && root.exitNodeOn)
+                            ? "#ffd54a"
+                            : Qt.rgba(1, 1, 1, 0.55)
+                    font.pixelSize: root.baseFontSize * 0.75
+                    elide: Text.ElideRight
+                }
 
                 // Tailscale exit-node toggle. Shares the pill idiom of the
                 // window-range buttons below, and greys out whenever the
@@ -733,7 +864,7 @@ PlasmoidItem {
                             }
                             return Qt.rgba(1, 1, 1, 0.75)
                         }
-                        font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.64
+                        font.pixelSize: root.baseFontSize * 0.64
                     }
 
                     MouseArea {
@@ -781,7 +912,7 @@ PlasmoidItem {
                             y: -height
                             text: ((root.gridIntervals - index) * root.axisStepMs()) + " ms"
                             color: Qt.rgba(1, 1, 1, 0.45)
-                            font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.85
+                            font.pixelSize: root.baseFontSize * 0.85
                             opacity: 1
                         }
                     }
@@ -803,7 +934,7 @@ PlasmoidItem {
                     readonly property real rightMargin: 58
                     readonly property real chartW: Math.max(0, width - rightMargin)
                     readonly property real chartH: Math.max(0, height - padY * 2)
-                    readonly property real publicRealtimeLabelFontSize: Kirigami.Theme.defaultFont.pixelSize * 1.3
+                    readonly property real publicRealtimeLabelFontSize: root.baseFontSize * 1.3
                     // Gateway has one extra character (e.g. "1.1ms"), so scale down to match public-label width.
                     readonly property real gatewayRealtimeLabelFontSize: publicRealtimeLabelFontSize * 0.8
                     // 4px sampling keeps point count low while remaining visually smooth.
@@ -1515,7 +1646,7 @@ PlasmoidItem {
                             id: maxText
                             anchors.centerIn: parent
                             color: "#ffdd44"
-                            font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.2
+                            font.pixelSize: root.baseFontSize * 1.2
                             font.bold: true
                             text: chartView.cachedMax >= 0 ? chartView.cachedMax.toFixed(1) + " ms" : ""
                         }
@@ -1549,7 +1680,7 @@ PlasmoidItem {
                             id: minText
                             anchors.centerIn: parent
                             color: "#ffdd44"
-                            font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.2
+                            font.pixelSize: root.baseFontSize * 1.2
                             font.bold: true
                             text: chartView.cachedMin >= 0 ? chartView.cachedMin.toFixed(1) + " ms" : ""
                         }
@@ -1631,7 +1762,7 @@ PlasmoidItem {
                     verticalAlignment: Text.AlignVCenter
                     text: "Last Internet Ping Received: " + root.lastPingReceivedText
                     color: Qt.rgba(1, 1, 1, 0.45)
-                    font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.75
+                    font.pixelSize: root.baseFontSize * 0.75
                     elide: Text.ElideRight
                     opacity: 1
                 }
@@ -1657,7 +1788,7 @@ PlasmoidItem {
                                 anchors.centerIn: parent
                                 text: modelData.label
                                 color: active ? "#ffd54a" : Qt.rgba(1, 1, 1, 0.75)
-                                font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 0.64
+                                font.pixelSize: root.baseFontSize * 0.64
                             }
 
                             MouseArea {
@@ -1687,6 +1818,7 @@ PlasmoidItem {
                 if (gatewayCommand.length > 0) {
                     executableSource.disconnectSource(gatewayCommand)
                 }
+                executableSource.disconnectSource(egressCommand)
                 executableSource.disconnectSource(exitNodeStatusCommand)
                 executableSource.disconnectSource(exitNodeOnCommand)
                 executableSource.disconnectSource(exitNodeOffCommand)
