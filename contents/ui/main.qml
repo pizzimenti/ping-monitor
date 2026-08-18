@@ -648,10 +648,10 @@ PlasmoidItem {
         egressViaExitNode = egressRequestViaExitNode;
     }
 
-    // Both triggers mean the displayed identity may no longer be true. Mark it
-    // stale rather than clearing it: hiding the label outright would shift the
-    // layout for the few seconds a lookup takes, whereas dimming keeps the row
-    // stable while still signalling "re-checking".
+    // Both triggers mean the displayed identity may no longer be true. While
+    // stale, the label renders a neutral "…" placeholder — there is no
+    // consistent IP state to report during the transition, so it reports
+    // none rather than styling the outgoing value.
     function invalidateEgress() {
         egressStale = true;
         egressRefreshDebounce.restart();
@@ -978,10 +978,20 @@ PlasmoidItem {
                 // Coloured by routing so the distinction reads without parsing
                 // the text: amber means traffic is leaving via the exit node,
                 // muted means it is going out locally.
+                //
+                // While a re-lookup is pending the label shows a neutral "…"
+                // instead of the old value: there is no consistent IP state to
+                // report, so report none. (An earlier iteration dimmed the old
+                // text via opacity instead — the dimmed amber and dimmed grey
+                // read as two extra colours mid-transition, and the softened
+                // glyph edges even read as a font-size change.)
                 Text {
-                    visible: root.egressOk && text.length > 0
+                    visible: (root.egressOk || root.egressStale) && text.length > 0
                     Layout.maximumWidth: Kirigami.Units.gridUnit * 14
                     text: {
+                        if (root.egressStale) {
+                            return "…"
+                        }
                         if (!root.egressOk) {
                             return ""
                         }
@@ -990,14 +1000,12 @@ PlasmoidItem {
                         }
                         return root.egressOrg.length > 0 ? root.egressOrg : root.egressIp
                     }
-                    // Snapshot, not live state — see egressViaExitNode.
-                    color: root.egressViaExitNode
+                    // Snapshot, not live state — see egressViaExitNode. The
+                    // placeholder is always neutral: colour claims a routing
+                    // state, and mid-transition there is none to claim.
+                    color: (!root.egressStale && root.egressViaExitNode)
                             ? "#ffd54a"
                             : Qt.rgba(1, 1, 1, 0.55)
-                    // Dimmed while a re-lookup is pending, so the moment
-                    // between "route changed" and "new answer arrived" reads
-                    // as provisional rather than as fact.
-                    opacity: root.egressStale ? 0.45 : 1.0
                     // egressOrg and egressIp come from an HTTP response.
                     // Text.AutoText would interpret crafted markup as rich
                     // text and can load inline images, so pin it to literal
