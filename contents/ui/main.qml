@@ -80,6 +80,12 @@ PlasmoidItem {
     // down or the binary is missing, which is distinct from "off" — we don't
     // know the state, so the button greys out rather than inviting a click.
     property bool exitNodeStatusOk: false
+    // Latches true on the first successful poll and never reverts. Separate
+    // from exitNodeStatusOk: before this is set the exit-node flags hold QML
+    // defaults, not last-known state, and must not be used to classify
+    // anything; after it, transient poll failures leave meaningful last-known
+    // values behind.
+    property bool exitNodeEverPolled: false
     // tailscaled's BackendState is "Running"; false while logged out, stopped,
     // or still starting.
     property bool exitNodeBackendUp: false
@@ -509,6 +515,8 @@ PlasmoidItem {
             exitNodeStatusOk = false;
             return;
         }
+        const firstPoll = !exitNodeEverPolled;
+        exitNodeEverPolled = true;
         exitNodeStatusOk = true;
         exitNodeBackendUp = parsed.backendUp;
         exitNodeAnyActive = parsed.anyActive;
@@ -517,6 +525,14 @@ PlasmoidItem {
         exitNodePeerOnline = parsed.peerOnline;
         exitNodeOn = parsed.on;
         exitNodeIp = parsed.ip;
+        // A lookup deferred by refreshEgress's never-polled gate is released
+        // here, now that classification has real state to snapshot. (If the
+        // anyActive assignment above just changed value, its change handler
+        // already restarted the debounce — restarting again merely resets the
+        // same timer.)
+        if (firstPoll && (!egressOk || egressStale)) {
+            egressRefreshDebounce.restart();
+        }
     }
 
     // Identity of the path packets to the internet actually take, read from
@@ -645,13 +661,24 @@ PlasmoidItem {
         if (!samplingActive) {
             return;
         }
-        // Deliberately not gated on exitNodeStatusOk. A transient `tailscale
-        // status` failure leaves exitNodeOn holding its last known value,
-        // which is still the best available description of how curl will
-        // actually leave; folding in the validity flag would instead classify
-        // the request as direct while it demonstrably traverses the exit node.
-        // That error would also be sticky — exitNodeOn never changed, so
-        // onExitNodeOnChanged would never fire to correct it.
+        // Never dispatch before the FIRST successful status poll. On widget
+        // load, popup expand fires this lookup and the first exit-node poll in
+        // the same tick; if curl returned first, the snapshot below read
+        // exitNodeAnyActive's pre-poll QML default (false) and committed
+        // tunnel data with direct styling — colour and text describing
+        // different moments. Deferred, not dropped: applyExitNodeStatus kicks
+        // the debounce when that first poll lands.
+        if (!exitNodeEverPolled) {
+            egressStale = egressOk;
+            return;
+        }
+        // Deliberately NOT gated on exitNodeStatusOk, though. After the first
+        // poll, a transient `tailscale status` failure leaves the flags
+        // holding their last known values, which remain the best available
+        // description of how curl will actually leave; folding in the
+        // validity flag would classify the request as direct while it
+        // demonstrably traverses the exit node — stickily, since the flags
+        // never change, so no change-handler would fire to correct it.
         egressRequestViaExitNode = exitNodeAnyActive;
         egressRequestFingerprint = routeFingerprint;
         executableSource.disconnectSource(egressCommand);
