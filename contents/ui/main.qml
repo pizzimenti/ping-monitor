@@ -80,11 +80,15 @@ PlasmoidItem {
     // down or the binary is missing, which is distinct from "off" — we don't
     // know the state, so the button greys out rather than inviting a click.
     property bool exitNodeStatusOk: false
-    // Latches true on the first successful poll and never reverts. Separate
-    // from exitNodeStatusOk: before this is set the exit-node flags hold QML
-    // defaults, not last-known state, and must not be used to classify
-    // anything; after it, transient poll failures leave meaningful last-known
-    // values behind.
+    // Latches true on the first COMPLETED poll — success or failure — and
+    // never reverts. Separate from exitNodeStatusOk: before any poll has
+    // answered, the exit-node flags hold QML defaults, not last-known state,
+    // and must not be used to classify anything. A completed-but-failed first
+    // poll releases the latch too: on a host without tailscale (a supported
+    // setup per the README) the poll always fails, and "failed" is itself the
+    // answer — no tailscaled means no exit node, so the defaults ARE the
+    // correct last-known state (direct), and the egress label must not be
+    // held hostage waiting for a success that will never come.
     property bool exitNodeEverPolled: false
     // tailscaled's BackendState is "Running"; false while logged out, stopped,
     // or still starting.
@@ -513,6 +517,15 @@ PlasmoidItem {
             // truncated. We no longer know the real state, so drop to the
             // disabled presentation instead of acting on stale flags.
             exitNodeStatusOk = false;
+            // A failure still completes the first poll: it answers "no
+            // tailscaled, therefore no exit node", which releases any
+            // deferred egress lookup to classify as direct.
+            if (!exitNodeEverPolled) {
+                exitNodeEverPolled = true;
+                if (!egressOk || egressStale) {
+                    egressRefreshDebounce.restart();
+                }
+            }
             return;
         }
         const firstPoll = !exitNodeEverPolled;
@@ -905,7 +918,14 @@ PlasmoidItem {
         // popup's amber accent: the warn tier already colours the satellite
         // amber, and an amber orbit around an amber glyph vanishes at 22 px.
         readonly property real traySide: Math.min(width, height)
-        readonly property bool tunneled: root.exitNodeAnyActive
+        // Gated on exitNodeStatusOk, unlike the egress classification:
+        // exitNodeAnyActive retains its last value across poll failures,
+        // which is right for classifying an in-flight lookup but wrong here —
+        // the orbit makes a positive "you are tunneled" claim, and after
+        // tailscaled dies that claim would stand indefinitely while traffic
+        // actually flows direct. Same rule as the tray tooltip: when unsure,
+        // claim nothing.
+        readonly property bool tunneled: root.exitNodeStatusOk && root.exitNodeAnyActive
 
         Rectangle {
             visible: trayArea.tunneled
