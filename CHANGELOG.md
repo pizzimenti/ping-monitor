@@ -5,6 +5,38 @@ All notable changes to Ping Monitor are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] — 2026-08-19
+
+### Added
+
+- **Orbit-ring tray indicator.** While the tailnet routes through an exit
+  node, the satellite tray icon gains a faint blue orbit ring with a
+  small moon at its upper right — tunnel state reads from the panel
+  without opening the popup. Keyed to *any* selected exit node (the
+  honest "is my traffic tunneled" signal), not just the widget's
+  configured host. Gateway blue rather than amber because the warn tier
+  already colours the satellite amber, and an amber orbit around an
+  amber glyph vanishes at 22 px. The glyph yields 20% while decorated
+  and returns to full size when direct.
+
+### Fixed
+
+- **Startup race that classified tunnel data as direct egress.** On
+  widget load, the egress lookup and the first exit-node status poll
+  were dispatched in the same tick; if the lookup returned first, it was
+  classified against pre-poll defaults and committed the exit node's
+  address with direct (grey) styling — visible later as colour updating
+  out of step with text. The lookup now defers until the first
+  successful status poll. Transient poll failures after that first poll
+  still classify from last-known state (the round-4 invariant from
+  PR #3), now stated in comments alongside the new gate.
+- **Transition presentation.** The 45%-opacity dim on a stale egress
+  label produced two unintended intermediate colours and read as a
+  font-size change. While a re-lookup is pending the label now shows a
+  neutral muted "…" — there is no consistent IP state to report during a
+  transition, so it reports none. Text and colour only ever land
+  together, from a completed lookup.
+
 ## [2.2.0] — 2026-08-17
 
 ### Added

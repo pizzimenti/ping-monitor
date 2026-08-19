@@ -80,6 +80,16 @@ PlasmoidItem {
     // down or the binary is missing, which is distinct from "off" — we don't
     // know the state, so the button greys out rather than inviting a click.
     property bool exitNodeStatusOk: false
+    // Latches true on the first COMPLETED poll — success or failure — and
+    // never reverts. Separate from exitNodeStatusOk: before any poll has
+    // answered, the exit-node flags hold QML defaults, not last-known state,
+    // and must not be used to classify anything. A completed-but-failed first
+    // poll releases the latch too: on a host without tailscale (a supported
+    // setup per the README) the poll always fails, and "failed" is itself the
+    // answer — no tailscaled means no exit node, so the defaults ARE the
+    // correct last-known state (direct), and the egress label must not be
+    // held hostage waiting for a success that will never come.
+    property bool exitNodeEverPolled: false
     // tailscaled's BackendState is "Running"; false while logged out, stopped,
     // or still starting.
     property bool exitNodeBackendUp: false
@@ -507,8 +517,19 @@ PlasmoidItem {
             // truncated. We no longer know the real state, so drop to the
             // disabled presentation instead of acting on stale flags.
             exitNodeStatusOk = false;
+            // A failure still completes the first poll: it answers "no
+            // tailscaled, therefore no exit node", which releases any
+            // deferred egress lookup to classify as direct.
+            if (!exitNodeEverPolled) {
+                exitNodeEverPolled = true;
+                if (!egressOk || egressStale) {
+                    egressRefreshDebounce.restart();
+                }
+            }
             return;
         }
+        const firstPoll = !exitNodeEverPolled;
+        exitNodeEverPolled = true;
         exitNodeStatusOk = true;
         exitNodeBackendUp = parsed.backendUp;
         exitNodeAnyActive = parsed.anyActive;
@@ -517,6 +538,14 @@ PlasmoidItem {
         exitNodePeerOnline = parsed.peerOnline;
         exitNodeOn = parsed.on;
         exitNodeIp = parsed.ip;
+        // A lookup deferred by refreshEgress's never-polled gate is released
+        // here, now that classification has real state to snapshot. (If the
+        // anyActive assignment above just changed value, its change handler
+        // already restarted the debounce — restarting again merely resets the
+        // same timer.)
+        if (firstPoll && (!egressOk || egressStale)) {
+            egressRefreshDebounce.restart();
+        }
     }
 
     // Identity of the path packets to the internet actually take, read from
@@ -610,6 +639,14 @@ PlasmoidItem {
     function applyEgress(parsed) {
         if (!parsed) {
             egressOk = false;
+            // The request completed — it just failed. Clearing the pending
+            // flag keeps "…" meaning strictly "a lookup is queued or in
+            // flight"; leaving it set rendered a finished failure as
+            // perpetually in-progress for the whole gap between retries.
+            // With both flags down the label hides, which also unifies the
+            // two failure cases (first-ever fetch vs re-lookup) — they
+            // previously presented differently for no reason.
+            egressStale = false;
             return;
         }
         // Routing moved while this request was in flight, so the address it
@@ -632,10 +669,10 @@ PlasmoidItem {
         egressViaExitNode = egressRequestViaExitNode;
     }
 
-    // Both triggers mean the displayed identity may no longer be true. Mark it
-    // stale rather than clearing it: hiding the label outright would shift the
-    // layout for the few seconds a lookup takes, whereas dimming keeps the row
-    // stable while still signalling "re-checking".
+    // Both triggers mean the displayed identity may no longer be true. While
+    // stale, the label renders a neutral "…" placeholder — there is no
+    // consistent IP state to report during the transition, so it reports
+    // none rather than styling the outgoing value.
     function invalidateEgress() {
         egressStale = true;
         egressRefreshDebounce.restart();
@@ -645,13 +682,24 @@ PlasmoidItem {
         if (!samplingActive) {
             return;
         }
-        // Deliberately not gated on exitNodeStatusOk. A transient `tailscale
-        // status` failure leaves exitNodeOn holding its last known value,
-        // which is still the best available description of how curl will
-        // actually leave; folding in the validity flag would instead classify
-        // the request as direct while it demonstrably traverses the exit node.
-        // That error would also be sticky — exitNodeOn never changed, so
-        // onExitNodeOnChanged would never fire to correct it.
+        // Never dispatch before the FIRST successful status poll. On widget
+        // load, popup expand fires this lookup and the first exit-node poll in
+        // the same tick; if curl returned first, the snapshot below read
+        // exitNodeAnyActive's pre-poll QML default (false) and committed
+        // tunnel data with direct styling — colour and text describing
+        // different moments. Deferred, not dropped: applyExitNodeStatus kicks
+        // the debounce when that first poll lands.
+        if (!exitNodeEverPolled) {
+            egressStale = egressOk;
+            return;
+        }
+        // Deliberately NOT gated on exitNodeStatusOk, though. After the first
+        // poll, a transient `tailscale status` failure leaves the flags
+        // holding their last known values, which remain the best available
+        // description of how curl will actually leave; folding in the
+        // validity flag would classify the request as direct while it
+        // demonstrably traverses the exit node — stickily, since the flags
+        // never change, so no change-handler would fire to correct it.
         egressRequestViaExitNode = exitNodeAnyActive;
         egressRequestFingerprint = routeFingerprint;
         executableSource.disconnectSource(egressCommand);
@@ -867,7 +915,53 @@ PlasmoidItem {
         Layout.minimumHeight: verticalPanel ? width : Kirigami.Units.iconSizes.small
         Layout.preferredWidth: verticalPanel ? Kirigami.Units.iconSizes.smallMedium : height
         Layout.preferredHeight: verticalPanel ? width : Kirigami.Units.iconSizes.smallMedium
+        id: trayArea
         onClicked: root.expanded = !root.expanded
+
+        // Exit-node indicator: a faint orbit ring with a small "moon"
+        // revolving around the satellite while an exit node is engaged
+        // (any exit node — the honest "is my traffic tunneled" signal,
+        // matching the egress label's classification, not just whether OUR
+        // configured host is the one selected). Gateway blue rather than the
+        // popup's amber accent: the warn tier already colours the satellite
+        // amber, and an amber orbit around an amber glyph vanishes at 22 px.
+        readonly property real traySide: Math.min(width, height)
+        // Gated on exitNodeStatusOk, unlike the egress classification:
+        // exitNodeAnyActive retains its last value across poll failures,
+        // which is right for classifying an in-flight lookup but wrong here —
+        // the orbit makes a positive "you are tunneled" claim, and after
+        // tailscaled dies that claim would stand indefinitely while traffic
+        // actually flows direct. Same rule as the tray tooltip: when unsure,
+        // claim nothing.
+        readonly property bool tunneled: root.exitNodeStatusOk && root.exitNodeAnyActive
+
+        Rectangle {
+            visible: trayArea.tunneled
+            anchors.centerIn: parent
+            width: trayArea.traySide
+            height: trayArea.traySide
+            radius: trayArea.traySide / 2
+            color: "transparent"
+            border.width: 1
+            border.color: root.gatewayColor
+            opacity: 0.5
+        }
+
+        // The moon sits statically at the upper-right of the ring — no
+        // revolve animation on purpose; a persistent state doesn't need
+        // persistent motion, and the panel repaints nothing for it.
+        Rectangle {
+            id: orbitMoon
+            visible: trayArea.tunneled
+            readonly property real angleDeg: -60
+            readonly property real orbitR: trayArea.traySide / 2
+            width: Math.max(3, trayArea.traySide * 0.18)
+            height: width
+            radius: width / 2
+            color: root.gatewayColor
+            x: trayArea.width / 2 + orbitR * Math.cos(angleDeg * Math.PI / 180) - width / 2
+            y: trayArea.height / 2 + orbitR * Math.sin(angleDeg * Math.PI / 180) - height / 2
+        }
 
         Kirigami.Icon {
             anchors.fill: parent
@@ -876,6 +970,9 @@ PlasmoidItem {
             color: root.iconColor
             opacity: root.iconOpacity
             active: root.expanded
+            // The orbit needs breathing room at 22 px; the glyph yields 20%
+            // while decorated and returns to full size when direct.
+            scale: trayArea.tunneled ? 0.8 : 1.0
         }
     }
 
@@ -951,10 +1048,20 @@ PlasmoidItem {
                 // Coloured by routing so the distinction reads without parsing
                 // the text: amber means traffic is leaving via the exit node,
                 // muted means it is going out locally.
+                //
+                // While a re-lookup is pending the label shows a neutral "…"
+                // instead of the old value: there is no consistent IP state to
+                // report, so report none. (An earlier iteration dimmed the old
+                // text via opacity instead — the dimmed amber and dimmed grey
+                // read as two extra colours mid-transition, and the softened
+                // glyph edges even read as a font-size change.)
                 Text {
-                    visible: root.egressOk && text.length > 0
+                    visible: (root.egressOk || root.egressStale) && text.length > 0
                     Layout.maximumWidth: Kirigami.Units.gridUnit * 14
                     text: {
+                        if (root.egressStale) {
+                            return "…"
+                        }
                         if (!root.egressOk) {
                             return ""
                         }
@@ -963,14 +1070,12 @@ PlasmoidItem {
                         }
                         return root.egressOrg.length > 0 ? root.egressOrg : root.egressIp
                     }
-                    // Snapshot, not live state — see egressViaExitNode.
-                    color: root.egressViaExitNode
+                    // Snapshot, not live state — see egressViaExitNode. The
+                    // placeholder is always neutral: colour claims a routing
+                    // state, and mid-transition there is none to claim.
+                    color: (!root.egressStale && root.egressViaExitNode)
                             ? "#ffd54a"
                             : Qt.rgba(1, 1, 1, 0.55)
-                    // Dimmed while a re-lookup is pending, so the moment
-                    // between "route changed" and "new answer arrived" reads
-                    // as provisional rather than as fact.
-                    opacity: root.egressStale ? 0.45 : 1.0
                     // egressOrg and egressIp come from an HTTP response.
                     // Text.AutoText would interpret crafted markup as rich
                     // text and can load inline images, so pin it to literal
