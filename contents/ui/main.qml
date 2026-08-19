@@ -639,6 +639,14 @@ PlasmoidItem {
     function applyEgress(parsed) {
         if (!parsed) {
             egressOk = false;
+            // The request completed — it just failed. Clearing the pending
+            // flag keeps "…" meaning strictly "a lookup is queued or in
+            // flight"; leaving it set rendered a finished failure as
+            // perpetually in-progress for the whole gap between retries.
+            // With both flags down the label hides, which also unifies the
+            // two failure cases (first-ever fetch vs re-lookup) — they
+            // previously presented differently for no reason.
+            egressStale = false;
             return;
         }
         // Routing moved while this request was in flight, so the address it
