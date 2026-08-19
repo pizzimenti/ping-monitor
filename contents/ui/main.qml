@@ -894,7 +894,46 @@ PlasmoidItem {
         Layout.minimumHeight: verticalPanel ? width : Kirigami.Units.iconSizes.small
         Layout.preferredWidth: verticalPanel ? Kirigami.Units.iconSizes.smallMedium : height
         Layout.preferredHeight: verticalPanel ? width : Kirigami.Units.iconSizes.smallMedium
+        id: trayArea
         onClicked: root.expanded = !root.expanded
+
+        // Exit-node indicator: a faint orbit ring with a small "moon"
+        // revolving around the satellite while an exit node is engaged
+        // (any exit node — the honest "is my traffic tunneled" signal,
+        // matching the egress label's classification, not just whether OUR
+        // configured host is the one selected). Gateway blue rather than the
+        // popup's amber accent: the warn tier already colours the satellite
+        // amber, and an amber orbit around an amber glyph vanishes at 22 px.
+        readonly property real traySide: Math.min(width, height)
+        readonly property bool tunneled: root.exitNodeAnyActive
+
+        Rectangle {
+            visible: trayArea.tunneled
+            anchors.centerIn: parent
+            width: trayArea.traySide
+            height: trayArea.traySide
+            radius: trayArea.traySide / 2
+            color: "transparent"
+            border.width: 1
+            border.color: root.gatewayColor
+            opacity: 0.5
+        }
+
+        // The moon sits statically at the upper-right of the ring — no
+        // revolve animation on purpose; a persistent state doesn't need
+        // persistent motion, and the panel repaints nothing for it.
+        Rectangle {
+            id: orbitMoon
+            visible: trayArea.tunneled
+            readonly property real angleDeg: -60
+            readonly property real orbitR: trayArea.traySide / 2
+            width: Math.max(3, trayArea.traySide * 0.18)
+            height: width
+            radius: width / 2
+            color: root.gatewayColor
+            x: trayArea.width / 2 + orbitR * Math.cos(angleDeg * Math.PI / 180) - width / 2
+            y: trayArea.height / 2 + orbitR * Math.sin(angleDeg * Math.PI / 180) - height / 2
+        }
 
         Kirigami.Icon {
             anchors.fill: parent
@@ -903,6 +942,9 @@ PlasmoidItem {
             color: root.iconColor
             opacity: root.iconOpacity
             active: root.expanded
+            // The orbit needs breathing room at 22 px; the glyph yields 20%
+            // while decorated and returns to full size when direct.
+            scale: trayArea.tunneled ? 0.8 : 1.0
         }
     }
 
